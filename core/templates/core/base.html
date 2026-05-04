@@ -48,6 +48,7 @@
                 <!-- <a href="{% url 'job_list' %}"
                     class="nav-link {% if request.resolver_match.url_name == 'job_list' %}active{% endif %}">💼 Jobs</a> -->
                 <!-- <a href="{% url 'export_csv' %}" class="nav-link">📥 Export CSV</a> -->
+                <a href="{% url 'extract_url' %}" class="nav-link {% if request.resolver_match.url_name == 'extract_url' %}active{% endif %}">🔗 URL Extractor</a>
                 <div class="sync-status {% if sync_running %}running{% else %}idle{% endif %}" id="sync-status">
                     <span class="dot"></span>
                     <span id="sync-label">{% if sync_running %}Syncing…{% else %}Idle{% endif %}</span>

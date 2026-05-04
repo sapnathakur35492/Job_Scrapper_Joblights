@@ -281,3 +281,50 @@ def clear_all_jobs(request):
     """Delete all jobs from the database (All Clear)."""
     Job.objects.all().delete()
     return JsonResponse({'status': 'ok'})
+
+
+def extract_url_page(request):
+    """Standalone URL extractor page."""
+    # Note: _sync_state is globally defined in this file.
+    return render(request, 'core/extract_url.html', {
+        'sync_running': _sync_state.get('running', False),
+    })
+
+
+@csrf_exempt
+@require_POST
+def api_extract_url(request):
+    """
+    API endpoint for extracting final job URLs from Jobright apply links.
+    Supports single URL or batch mode.
+    
+    Single: {"url": "https://jobright.ai/jobs/info/..."}
+    Batch:  {"urls": ["...", "..."]}
+    """
+    import logging
+    log = logging.getLogger('sociax_sync.extractor')
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({'status': 'error', 'reason': 'Invalid JSON body'}, status=400)
+
+    from core.scrapers.jobright_extractor import extract_jobright_url, extract_jobright_urls_batch
+
+    # Batch mode
+    urls = body.get('urls')
+    if urls and isinstance(urls, list):
+        if len(urls) > 20:
+            return JsonResponse({'status': 'error', 'reason': 'Max 20 URLs per batch'}, status=400)
+        log.info(f"📦 Batch extraction: {len(urls)} URLs")
+        results = extract_jobright_urls_batch(urls)
+        return JsonResponse({'results': results})
+
+    # Single mode
+    url = body.get('url', '').strip()
+    if not url:
+        return JsonResponse({'status': 'error', 'reason': 'Missing "url" or "urls" field'}, status=400)
+
+    log.info(f"🔍 Single extraction: {url}")
+    result = extract_jobright_url(url)
+    return JsonResponse(result)

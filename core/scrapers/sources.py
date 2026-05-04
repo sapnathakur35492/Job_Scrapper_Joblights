@@ -103,6 +103,16 @@ class LinkResolver:
     def resolve_single(cls, url, session):
         """Resolves a single intermediate link."""
         try:
+            # Handle Jobright links using the new extractor engine
+            if 'jobright.ai/jobs/info/' in url:
+                from core.scrapers.jobright_extractor import extract_jobright_url
+                result = extract_jobright_url(url)
+                if result and result.get('status') == 'success':
+                    log.info(f"      ✨ Jobright extracted: {result.get('final_url')[:50]}...")
+                    return result.get('final_url')
+                return None
+
+            # Handle MigrateMate and others
             # Random delay to be nice
             time.sleep(random.uniform(0.5, 1.5))
             
@@ -124,69 +134,6 @@ class LinkResolver:
                 if href.startswith('http') and 'jobright.ai' not in href and 'migratemate.co' not in href:
                     return href
                     
-            # Strategy 3: Check __NEXT_DATA__ for Jobright
-            if 'jobright.ai' in url:
-                script = soup.find('script', id='__NEXT_DATA__')
-                if script:
-                    try:
-                        data = json.loads(script.string)
-                        def find_all_urls(obj, collection):
-                            if isinstance(obj, str) and obj.startswith('http'):
-                                # Block social/static/common news/tracking
-                                blocked = cls.NEWS_SITES + [
-                                    'jobright.ai', 'google', 'linkedin', 'facebook', 'twitter', 'x.com', 
-                                    'glassdoor', 'favicon', 'logo', 'icon', '.png', '.jpg', '.jpeg', '.gif', 
-                                    '.svg', '.webp', 'media.li', 'tracking', 'analytics', 'pixel', 'ads.'
-                                ]
-                                if not any(x in obj.lower() for x in blocked):
-                                    collection.append(obj)
-                            elif isinstance(obj, dict):
-                                for v in obj.values(): find_all_urls(v, collection)
-                            elif isinstance(obj, list):
-                                for i in obj: find_all_urls(i, collection)
-
-                        candidates = []
-                        find_all_urls(data, candidates)
-                        
-                        if candidates:
-                            # Rank candidates: 
-                            # 1. Known ATS or Jobs subdomain (Greenhouse, Lever, etc)
-                            # 2. Contains specific job-link keywords
-                            # 3. Specificity (Longer URLs are usually actual job posts)
-                            # 4. AVOID "news" or "article" even if not in blocked list
-                            
-                            def score_url(u):
-                                u_lower = u.lower()
-                                score = 0
-                                # Match common portals (Max Priority)
-                                if any(p in u_lower for p in cls.COMMON_PORTALS):
-                                    score += 100
-                                # Match job keywords
-                                if any(kw in u_lower for kw in ['/job/', '/jobs/', '/apply', '/careers/', 'career.', 'jobs.']):
-                                    score += 50
-                                # Negative score for news-like words even if not blocked
-                                if any(nw in u_lower for nw in ['/news/', '/article/', '/press/', '/blog/']):
-                                    score -= 80
-                                # Add length as minor priority
-                                score += min(len(u) / 10, 10) 
-                                return score
-
-                            ranked = sorted(candidates, key=score_url, reverse=True)
-                            best_link = ranked[0]
-                            
-                            # Final sanity check: if the best link still looks like news or has 0/negative score, 
-                            # fall back to a company URL if available
-                            if score_url(best_link) < 20: 
-                                # Try to find a plain company website in candidates
-                                for c in candidates:
-                                    if not any(x in c for x in ['/news/', '/article/', '/blog/']):
-                                        return c # Fairly safe fallback
-                            
-                            log.info(f"      ✨ Best candidate: {best_link[:50]}...")
-                            return best_link
-                        return None
-                    except: pass
-
         except Exception:
             pass
         return None

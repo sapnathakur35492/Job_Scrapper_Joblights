@@ -11,4 +11,6 @@ urlpatterns = [
     path('api/trigger-sync/', views.api_trigger_sync, name='api_trigger_sync'),
     path('api/stop-sync/', views.api_stop_sync, name='api_stop_sync'),
     path('api/status/', views.api_status, name='api_status'),
+    path('api/extract-url/', views.api_extract_url, name='api_extract_url'),
+    path('extract/', views.extract_url_page, name='extract_url'),
 ]

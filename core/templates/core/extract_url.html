@@ -1,0 +1,332 @@
+{% extends "core/base.html" %}
+
+{% block title %}URL Extractor | Sociax Sync{% endblock %}
+
+{% block content %}
+<div class="dashboard-container" style="padding: 40px; max-width: 900px; margin: 0 auto;">
+    <header style="margin-bottom: 40px; text-align: center;">
+        <h1 style="font-size: 2.5rem; margin-bottom: 15px; background: var(--gradient); -webkit-background-clip: text; color: transparent;">Jobright URL Extractor</h1>
+        <p style="color: var(--text-secondary); font-size: 1.1rem; max-width: 600px; margin: 0 auto;">
+            Extract the final, direct company job posting link from a Jobright Apply URL using our 7-step resolution engine.
+        </p>
+    </header>
+
+    <!-- Main Input Section -->
+    <div class="metric-card" style="padding: 30px; margin-bottom: 30px;">
+        <div style="display: flex; gap: 15px; flex-direction: column;">
+            <label for="url-input" style="color: var(--text-primary); font-weight: 500; font-size: 1.1rem;">Paste Jobright URL(s):</label>
+            <div style="position: relative;">
+                <textarea id="url-input" class="search-input" 
+                    placeholder="https://jobright.ai/jobs/info/...&#10;(Paste multiple URLs on new lines for batch extraction)" 
+                    style="width: 100%; min-height: 120px; padding: 15px; border-radius: 12px; border: 1px solid rgba(99, 102, 241, 0.3); background: rgba(10, 14, 26, 0.4); color: var(--text-primary); font-size: 15px; resize: vertical; transition: all 0.3s; font-family: monospace;"></textarea>
+            </div>
+            
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                <span id="url-count" style="color: var(--text-muted); font-size: 0.9rem;">0 URLs detected</span>
+                <button id="extract-btn" class="action-btn" style="padding: 12px 30px; font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 8px;">
+                    <span class="btn-text">Extract Final Links</span>
+                    <span class="spinner" style="display: none; width: 16px; height: 16px; border-width: 2px;"></span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Progress Indicator (Hidden by default) -->
+    <div id="progress-container" style="display: none; margin-bottom: 30px;">
+        <div class="metric-card" style="padding: 20px; background: rgba(99, 102, 241, 0.05); border-color: rgba(99, 102, 241, 0.2);">
+            <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 10px;">
+                <div class="spinner" style="width: 20px; height: 20px; border-color: rgba(255,255,255,0.1); border-top-color: var(--accent);"></div>
+                <h3 style="margin: 0; color: var(--accent); font-size: 1.1rem;">Extraction Engine Running...</h3>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span id="current-step-text" style="color: var(--text-secondary); font-size: 0.95rem; font-family: monospace;">Initializing...</span>
+                <span id="timer" style="color: var(--text-muted); font-size: 0.9rem; font-variant-numeric: tabular-nums;">0.0s</span>
+            </div>
+            <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; margin-top: 15px; overflow: hidden;">
+                <div id="progress-bar" style="height: 100%; width: 0%; background: var(--gradient); transition: width 0.5s ease;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Results Area -->
+    <div id="results-container" style="display: flex; flex-direction: column; gap: 20px;">
+        <!-- Results will be injected here via JS -->
+    </div>
+</div>
+
+<!-- Template for a successful result card -->
+<template id="success-card-template">
+    <div class="metric-card result-card" style="padding: 25px; border-left: 4px solid var(--success); display: flex; flex-direction: column; gap: 15px;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div>
+                <h3 class="result-title" style="margin: 0 0 5px 0; color: var(--text-primary); font-size: 1.2rem;"></h3>
+                <div class="result-company" style="color: var(--text-secondary); font-size: 1rem; font-weight: 500;"></div>
+            </div>
+            <div style="text-align: right;">
+                <span class="status-badge success" style="display: inline-block; padding: 4px 10px; border-radius: 20px; background: rgba(16, 185, 129, 0.1); color: var(--success); font-size: 0.85rem; font-weight: 600; margin-bottom: 5px;">✅ Success</span>
+                <div class="result-time" style="color: var(--text-muted); font-size: 0.85rem;"></div>
+            </div>
+        </div>
+        
+        <div style="background: rgba(10, 14, 26, 0.4); padding: 15px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+            <div style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px;">Final URL</div>
+            <a href="#" target="_blank" class="result-url" style="color: var(--accent); text-decoration: none; word-break: break-all; font-family: monospace; font-size: 0.95rem;"></a>
+        </div>
+        
+        <div style="display: flex; gap: 20px; font-size: 0.85rem;">
+            <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="color: var(--text-muted);">Method:</span>
+                <span class="result-method" style="color: var(--warning); font-family: monospace; background: rgba(245, 158, 11, 0.1); padding: 2px 6px; border-radius: 4px;"></span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="color: var(--text-muted);">Confidence:</span>
+                <span class="result-confidence" style="color: var(--text-primary); font-weight: 600;"></span>
+            </div>
+        </div>
+    </div>
+</template>
+
+<!-- Template for a failed result card -->
+<template id="failed-card-template">
+    <div class="metric-card result-card" style="padding: 25px; border-left: 4px solid var(--danger); display: flex; flex-direction: column; gap: 15px;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div>
+                <h3 class="result-title" style="margin: 0 0 5px 0; color: var(--text-primary); font-size: 1.2rem;">Unknown Job</h3>
+                <div class="result-company" style="color: var(--text-secondary); font-size: 1rem; font-weight: 500;"></div>
+            </div>
+            <div style="text-align: right;">
+                <span class="status-badge failed" style="display: inline-block; padding: 4px 10px; border-radius: 20px; background: rgba(239, 68, 68, 0.1); color: var(--danger); font-size: 0.85rem; font-weight: 600; margin-bottom: 5px;">❌ Failed</span>
+                <div class="result-time" style="color: var(--text-muted); font-size: 0.85rem;"></div>
+            </div>
+        </div>
+        
+        <div style="background: rgba(239, 68, 68, 0.05); padding: 15px; border-radius: 8px; border: 1px solid rgba(239, 68, 68, 0.1);">
+            <div style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px;">Reason</div>
+            <div class="result-reason" style="color: var(--danger); font-family: monospace; font-size: 0.95rem;"></div>
+        </div>
+        
+        <div style="display: flex; flex-direction: column; gap: 8px; font-size: 0.85rem;">
+            <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="color: var(--text-muted);">Input URL:</span>
+                <a href="#" target="_blank" class="input-url" style="color: var(--text-secondary); text-decoration: none; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 600px;"></a>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="color: var(--text-muted);">Last Attempted:</span>
+                <span class="result-method" style="color: var(--text-secondary); font-family: monospace; background: rgba(255, 255, 255, 0.05); padding: 2px 6px; border-radius: 4px;"></span>
+            </div>
+        </div>
+    </div>
+</template>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        const urlInput = document.getElementById('url-input');
+        const urlCount = document.getElementById('url-count');
+        const extractBtn = document.getElementById('extract-btn');
+        const btnText = extractBtn.querySelector('.btn-text');
+        const spinner = extractBtn.querySelector('.spinner');
+        const resultsContainer = document.getElementById('results-container');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const currentStepText = document.getElementById('current-step-text');
+        const timerText = document.getElementById('timer');
+        
+        let timerInterval;
+
+        // Update URL count dynamically
+        urlInput.addEventListener('input', () => {
+            const urls = getValidUrls(urlInput.value);
+            const count = urls.length;
+            urlCount.textContent = `${count} URL${count !== 1 ? 's' : ''} detected`;
+            urlInput.style.borderColor = count > 0 ? 'var(--accent)' : 'rgba(99, 102, 241, 0.3)';
+        });
+
+        function getValidUrls(text) {
+            return text.split('\n')
+                .map(line => line.trim())
+                .filter(line => line.startsWith('http'));
+        }
+
+        function startTimer() {
+            let startTime = Date.now();
+            timerText.textContent = '0.0s';
+            timerInterval = setInterval(() => {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                timerText.textContent = `${elapsed}s`;
+                
+                // Simulate progress bar based on time (assuming max 10s per request)
+                // Just visual feedback, not actual progress
+                let percent = Math.min((elapsed / 10) * 100, 95);
+                progressBar.style.width = `${percent}%`;
+            }, 100);
+        }
+
+        function stopTimer() {
+            clearInterval(timerInterval);
+            progressBar.style.width = '100%';
+        }
+
+        function renderSuccessCard(result) {
+            const template = document.getElementById('success-card-template');
+            const clone = template.content.cloneNode(true);
+            
+            clone.querySelector('.result-title').textContent = result.job_title || 'Unknown Job Title';
+            clone.querySelector('.result-company').textContent = result.company ? `at ${result.company}` : '';
+            clone.querySelector('.result-time').textContent = `${result.time_taken}s`;
+            
+            const urlEl = clone.querySelector('.result-url');
+            urlEl.textContent = result.final_url;
+            urlEl.href = result.final_url;
+            
+            clone.querySelector('.result-method').textContent = result.method;
+            clone.querySelector('.result-confidence').textContent = `${(result.confidence * 100).toFixed(0)}%`;
+            
+            return clone;
+        }
+
+        function renderFailedCard(result) {
+            const template = document.getElementById('failed-card-template');
+            const clone = template.content.cloneNode(true);
+            
+            if (result.job_title) {
+                clone.querySelector('.result-title').textContent = result.job_title;
+            }
+            if (result.company) {
+                clone.querySelector('.result-company').textContent = `at ${result.company}`;
+            }
+            
+            clone.querySelector('.result-time').textContent = `${result.time_taken}s`;
+            clone.querySelector('.result-reason').textContent = result.reason || 'Unknown error';
+            
+            const inputUrlEl = clone.querySelector('.input-url');
+            inputUrlEl.textContent = result.input_url;
+            inputUrlEl.href = result.input_url;
+            
+            clone.querySelector('.result-method').textContent = result.method;
+            
+            return clone;
+        }
+
+        // Fake step updates for visual feedback since the API doesn't stream status yet
+        let fakeStepInterval;
+        function cycleFakeSteps() {
+            const steps = [
+                "Step 1: Checking direct URL parameters...",
+                "Step 2: Inspecting HTML & NEXT_DATA payload...",
+                "Step 3: Probing public API endpoints...",
+                "Step 4: Extracting job title & company context...",
+                "Step 5: Executing targeted Google search...",
+                "Step 6: Testing known ATS patterns...",
+                "Step 7: Attempting authenticated fallback..."
+            ];
+            let idx = 0;
+            currentStepText.textContent = steps[0];
+            
+            fakeStepInterval = setInterval(() => {
+                idx = (idx + 1) % steps.length;
+                currentStepText.textContent = steps[idx];
+            }, 1500); // Change text every 1.5s
+        }
+
+        function stopFakeSteps() {
+            clearInterval(fakeStepInterval);
+        }
+
+        extractBtn.addEventListener('click', async () => {
+            const urls = getValidUrls(urlInput.value);
+            if (urls.length === 0) {
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'No URLs',
+                    text: 'Please paste at least one valid URL starting with http',
+                    background: '#111827',
+                    color: '#fff',
+                    confirmButtonColor: '#4f46e5'
+                });
+                return;
+            }
+
+            if (urls.length > 20) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Too Many URLs',
+                    text: 'Maximum 20 URLs allowed per batch',
+                    background: '#111827',
+                    color: '#fff',
+                    confirmButtonColor: '#4f46e5'
+                });
+                return;
+            }
+
+            // UI State updates
+            extractBtn.disabled = true;
+            btnText.textContent = urls.length > 1 ? `Extracting ${urls.length} URLs...` : 'Extracting...';
+            spinner.style.display = 'inline-block';
+            resultsContainer.innerHTML = '';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            
+            startTimer();
+            cycleFakeSteps();
+
+            try {
+                // Determine if single or batch
+                const payload = urls.length === 1 ? { url: urls[0] } : { urls: urls };
+                
+                const response = await fetch('/api/extract-url/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    const results = urls.length === 1 ? [data] : data.results;
+                    
+                    currentStepText.textContent = "Extraction complete!";
+                    
+                    results.forEach(res => {
+                        if (res.status === 'success') {
+                            resultsContainer.appendChild(renderSuccessCard(res));
+                        } else {
+                            resultsContainer.appendChild(renderFailedCard(res));
+                        }
+                    });
+                } else {
+                    currentStepText.textContent = "API Error";
+                    Swal.fire({
+                        icon: 'error',
+                        title: 'Extraction Failed',
+                        text: data.reason || 'An unknown server error occurred',
+                        background: '#111827',
+                        color: '#fff',
+                        confirmButtonColor: '#ef4444'
+                    });
+                }
+            } catch (error) {
+                console.error("Extraction error:", error);
+                currentStepText.textContent = "Network Error";
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Network Error',
+                    text: 'Failed to connect to the server. Please try again.',
+                    background: '#111827',
+                    color: '#fff',
+                    confirmButtonColor: '#ef4444'
+                });
+            } finally {
+                stopTimer();
+                stopFakeSteps();
+                extractBtn.disabled = false;
+                btnText.textContent = 'Extract Final Links';
+                spinner.style.display = 'none';
+            }
+        });
+    });
+</script>
+{% endblock %}
