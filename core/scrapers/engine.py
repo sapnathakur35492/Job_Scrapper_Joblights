@@ -1,9 +1,12 @@
 """
-Sociax Sync Engine — 3 Sources Only
+Sociax Sync Engine — 3 Sources
 Simplify Jobs | Jobright.ai | MigrateMate
 """
 import os
+import json
 import logging
+import time
+import random
 from datetime import datetime, timedelta, timezone as tz
 from django.utils import timezone
 from core.models import Job
@@ -11,10 +14,9 @@ from core.utils import (
     clean_text, is_visa_sponsored, is_entry_level,
     is_us_based, is_direct_link, generate_job_hash,
     clean_location, get_favicon_url, fetch_full_description,
-    extract_job_metadata
+    extract_job_metadata, is_valid_apply_url, is_live_apply_url
 )
-# from core.scrapers.sources import SimplifyScraper, JobrightScraper, MigrateMateScraper, LinkResolver
-from core.scrapers.sources import SimplifyScraper, JobrightScraper, LinkResolver
+from core.scrapers.sources import SimplifyScraper, JobrightScraper, MigrateMateScraper, LinkResolver
 from core.scrapers.categories import matches_target_titles
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -28,15 +30,19 @@ class ScraperEngine:
         self._last_scraped = 0
         self._last_saved = 0
         self.jobright_stats = {'total': 0, 'internships': 0}
+        self._checkpoint_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            'sync_checkpoint.json'
+        )
 
     def run_sync(self, should_continue=None):
-        """Run sync: Simplify & Jobright FIRST. (MigrateMate currently disabled)"""
+        """Run sync: Simplify, Jobright & MigrateMate with checkpoint resume."""
         log.info("🚀 Starting sync cycle...")
 
         scrapers = [
             SimplifyScraper(),
             JobrightScraper(),
-            # MigrateMateScraper(), # Disabled as per user request to avoid blockages
+            MigrateMateScraper(),
         ]
 
         total_scraped = 0
@@ -49,44 +55,52 @@ class ScraperEngine:
                 log.info("🛑 Stop signal received. Ending sync.")
                 break
 
-            log.info(f"🔄 Pass {round_num}: Fetching all sources in parallel...")
+            # ── Checkpoint Resume: skip already-completed sources ──
+            checkpoint = self._load_checkpoint()
+            completed_sources = checkpoint.get('completed_sources', [])
+            scrapers_to_run = [s for s in scrapers if s.__class__.__name__ not in completed_sources]
+
+            if not scrapers_to_run:
+                # All sources completed in previous interrupted pass — reset
+                self._save_checkpoint({'completed_sources': []})
+                scrapers_to_run = list(scrapers)
+                completed_sources = []
+
+            log.info(f"🔄 Pass {round_num}: Fetching {len(scrapers_to_run)} sources ({len(completed_sources)} resumed)...")
             
             pass_saved = 0
             all_raw_jobs = []
             
-            # 1. Parallel Fetch from all sources
-            with ThreadPoolExecutor(max_workers=len(scrapers)) as fetch_executor:
-                future_to_name = {
-                    fetch_executor.submit(scraper.fetch): scraper.__class__.__name__ 
-                    for scraper in scrapers
+            # 1. Parallel Fetch from incomplete sources only
+            with ThreadPoolExecutor(max_workers=len(scrapers_to_run)) as fetch_executor:
+                future_to_scraper = {
+                    fetch_executor.submit(s.fetch): s for s in scrapers_to_run
                 }
-                for future in as_completed(future_to_name):
-                    name = future_to_name[future]
+                for future in as_completed(future_to_scraper):
+                    scraper_inst = future_to_scraper[future]
+                    name = scraper_inst.__class__.__name__
                     try:
                         source_jobs = future.result()
                         log.info(f"    📡 {name} returned {len(source_jobs)} raw listings.")
                         all_raw_jobs.extend(source_jobs)
+                        # Save checkpoint after each source completes
+                        completed_sources.append(name)
+                        self._save_checkpoint({'completed_sources': completed_sources, 'pass': round_num})
                     except Exception as e:
                         log.error(f"  🛑 {name} fetch error: {e}")
 
             if not all_raw_jobs:
                 log.info("  ⚠️ No jobs found in this pass.")
             else:
-                # 2. Filter and Mix
-                # Shuffle or just process as they come (all_raw_jobs is already somewhat mixed by parallel completion)
-                import random
+                # 2. Filter and shuffle
                 random.shuffle(all_raw_jobs)
                 
-                valid_jobs = []
-                for raw in all_raw_jobs:
-                    if self._is_job_valid(raw):
-                        valid_jobs.append(raw)
-                
+                valid_jobs = [raw for raw in all_raw_jobs if self._is_job_valid(raw)]
                 log.info(f"    ⭐ Found {len(valid_jobs)} valid jobs after filtering.")
 
-                # 3. Parallel Link Resolution for valid jobs
+                # 3. Parallel Link Resolution + Save (with None check)
                 if valid_jobs:
-                    log.info(f"    🔗 Resolving {len(valid_jobs)} direct links in parallel...")
+                    log.info(f"    🔗 Resolving {len(valid_jobs)} direct links...")
                     with ThreadPoolExecutor(max_workers=10) as resolver_executor:
                         future_to_job = {
                             resolver_executor.submit(self._resolve_job_link, job): job 
@@ -97,7 +111,8 @@ class ScraperEngine:
                             
                             try:
                                 resolved_job = future.result()
-                                if self._save_job(resolved_job):
+                                # resolved_job is None if link resolution failed — skip it
+                                if resolved_job and self._save_job(resolved_job):
                                     total_saved += 1
                                     pass_saved += 1
                             except Exception as e:
@@ -105,12 +120,17 @@ class ScraperEngine:
 
             log.info(f"  ✅ Pass {round_num} complete. +{pass_saved} jobs saved.")
             
-            # Continuous syncing: micro-delay to prevent CPU pegging but keep it moving
-            import time
-            time.sleep(1)
+            # Reset checkpoint for next pass
+            self._save_checkpoint({'completed_sources': []})
+            
+            # 5-minute backoff between passes (with stop-check granularity)
+            log.info("  ⏳ Next pass in 5 minutes...")
+            for _ in range(300):
+                if should_continue and not should_continue():
+                    break
+                time.sleep(1)
             
             round_num += 1
-            # Continuous syncing: removed the safety cap as requested.
 
         # Final Dashboard Summary
         self._last_scraped = total_scraped
@@ -160,7 +180,7 @@ class ScraperEngine:
                     return False
                 self.jobright_stats['internships'] += 1
 
-        # 4. STRICT 48-Hour Date Filter (Requested: "Last 48 hours")
+        # 4. STRICT 24-Hour Date Filter (Requested: "Last 24 hours")
         posted_date = raw.get('posted_date')
         if not posted_date: 
             log.info(f"  ❌ Missing date skip: {title}")
@@ -172,43 +192,72 @@ class ScraperEngine:
 
         time_since_posted = timezone.now() - posted_date
         
-        # Strictly 48 hours Hard Limit (Requested by User)
-        if time_since_posted.total_seconds() > 172800:
-            log.info(f"  ❌ Stale skip (>48h): {title}")
+        # Strictly 24 hours Hard Limit (Requested by User)
+        if time_since_posted.total_seconds() > 86400:
+            log.info(f"  ❌ Stale skip (>24h): {title}")
             return False
             
-        # 5. Duplicate Check (Hash)
+        # 5. Duplicate Check (field-based + hash for backward compatibility)
         job_hash = generate_job_hash(company, title, location)
-        existing = Job.objects.filter(job_hash=job_hash).first()
-        if existing:
-            if len(existing.description) < 300:
-                return True
+        if Job.objects.filter(job_hash=job_hash).exists():
+            return False
+        # Also check by fields directly (catches slight hash formula changes)
+        if Job.objects.filter(
+            title__iexact=title,
+            company__iexact=company,
+            location__iexact=location
+        ).exists():
             return False
             
-        log.info(f"  ✅ [STRICT 48H] Valid: {title} ({source})")
+        log.info(f"  ✅ [STRICT 24H] Valid: {title} ({source})")
         return True
 
     def _resolve_job_link(self, raw):
-        """Worker for parallel link resolution."""
+        """Worker for parallel link resolution. Returns None if intermediary can't be resolved."""
         url = raw.get('external_apply_link', '')
+        intermediary_domains = ['jobright.ai', 'simplify.jobs', 'migratemate.co', 'github.com']
+        is_intermediary = any(x in url for x in intermediary_domains)
         
-        if any(x in url for x in ['jobright.ai', 'migratemate.co', 'simplify.jobs', 'github.com']):
+        if is_intermediary:
             try:
-                direct_link = LinkResolver.resolve_single(url, LinkResolver.session)
+                direct_link = LinkResolver.resolve_single(raw, LinkResolver.session)
                 if direct_link:
                     raw['external_apply_link'] = direct_link
-            except:
-                pass
+                else:
+                    # Resolution failed — discard this job entirely
+                    log.info(f"      ❌ Unresolvable link, discarding: {raw.get('company', '')[:20]}")
+                    return None
+            except Exception:
+                log.info(f"      ❌ Resolution error, discarding: {raw.get('company', '')[:20]}")
+                return None
         return raw
 
     def _save_job(self, raw):
-        """Final save to database."""
+        """Final save with strict URL validation gate."""
         title = raw.get('title', '').strip()
         company = raw.get('company', 'Unknown').strip()
         url = raw.get('external_apply_link', '')
         location = clean_location(raw.get('location', 'USA'))
         desc = raw.get('description', '')
         posted_date = raw.get('posted_date')
+        
+        # ══════════════════════════════════════════════════
+        #  STRICT URL VALIDATION GATE — No invalid links
+        # ══════════════════════════════════════════════════
+        if not is_valid_apply_url(url):
+            log.info(f"    🚫 Invalid apply URL rejected: {url[:60]} — {title[:30]}")
+            return False
+            
+        # ══════════════════════════════════════════════════
+        #  ACTIVE LIVE-LINK VERIFICATION & IDENTITY CHECK
+        # ══════════════════════════════════════════════════
+        if not is_live_apply_url(url, expected_company=company, expected_title=title):
+            log.warning(f"    💀 [IDENTITY/DEAD LINK] Rejected: {url[:60]} — {title[:30]} @ {company}")
+            return False
+        
+        # URL-based dedup (same URL from different title/source variations)
+        if Job.objects.filter(external_apply_link=url).exists():
+            return False
         
         # Detect visa sponsorship 
         visa_type = raw.get('visa_type', '')
@@ -222,7 +271,7 @@ class ScraperEngine:
 
         # Extract dynamic metadata
         meta = extract_job_metadata(title, desc)
-        job_hash = generate_job_hash(company, title, location)
+        job_hash = generate_job_hash(company, title, location, url)
 
         # Attempt to fetch full description if current one is too short
         if len(desc) < 300 and is_direct_link(url):
@@ -315,3 +364,22 @@ class ScraperEngine:
         count = expired.update(is_archived=True, is_published=False)
         if count:
             log.info(f"  🗂️ Archived {count} expired jobs.")
+
+    def _load_checkpoint(self):
+        """Load sync checkpoint from file for resume support."""
+        try:
+            if os.path.exists(self._checkpoint_path):
+                with open(self._checkpoint_path, 'r') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {'completed_sources': []}
+
+    def _save_checkpoint(self, data):
+        """Save sync checkpoint to file (lightweight, per-source batch only)."""
+        try:
+            data['updated_at'] = datetime.now(tz=tz.utc).isoformat()
+            with open(self._checkpoint_path, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.debug(f"Checkpoint save error: {e}")

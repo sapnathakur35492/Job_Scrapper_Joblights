@@ -87,7 +87,7 @@ class LinkResolver:
             for job in jobs:
                 link = job.get('external_apply_link', '')
                 if any(x in link for x in ['jobright.ai', 'migratemate.co']):
-                    future_to_job[executor.submit(cls.resolve_single, link, session)] = job
+                    future_to_job[executor.submit(cls.resolve_single, job, session)] = job
             
             for future in as_completed(future_to_job):
                 job = future_to_job[future]
@@ -100,8 +100,9 @@ class LinkResolver:
                     pass
 
     @classmethod
-    def resolve_single(cls, url, session):
+    def resolve_single(cls, job, session):
         """Resolves a single intermediate link."""
+        url = job.get('external_apply_link', '') if isinstance(job, dict) else job
         try:
             # Handle Jobright links using the new extractor engine
             if 'jobright.ai/jobs/info/' in url:
@@ -111,15 +112,94 @@ class LinkResolver:
                     log.info(f"      ✨ Jobright extracted: {result.get('final_url')[:50]}...")
                     return result.get('final_url')
                 return None
+                
+            # Handle MigrateMate links via DuckDuckGo Search Fallback
+            if 'migratemate.co' in url and isinstance(job, dict):
+                title = job.get('title', '')
+                company = job.get('company', '')
+                if title and company:
+                    search_query = f"{title} {company} careers apply"
+                    try:
+                        try:
+                            from ddgs import DDGS
+                        except ImportError:
+                            from duckduckgo_search import DDGS
 
-            # Handle MigrateMate and others
+                        with DDGS() as ddgs:
+                            results = list(ddgs.text(search_query, max_results=5))
+                            for res in results:
+                                res_url = res.get('href', '')
+                                if any(portal in res_url.lower() for portal in cls.COMMON_PORTALS):
+                                    return res_url
+                    except Exception as e:
+                        log.debug(f"      ⚠️ DDG failed, trying Yahoo: {e}")
+                    
+                    # Fallback to Custom Yahoo Search
+                    try:
+                        import urllib.parse
+                        query_plus = f'site:greenhouse.io OR site:lever.co OR site:workday.com OR site:ashbyhq.com "{title}" "{company}"'
+                        yahoo_url = f"https://search.yahoo.com/search?p={urllib.parse.quote(query_plus)}"
+                        resp = session.get(yahoo_url, timeout=10)
+                        if resp.status_code == 200:
+                            soup = BeautifulSoup(resp.text, 'html.parser')
+                            for a in soup.find_all('a', href=True):
+                                href = a['href']
+                                if any(portal in href.lower() for portal in cls.COMMON_PORTALS):
+                                    # Basic URL cleaning (Yahoo often wraps links)
+                                    if 'r.search.yahoo.com' in href:
+                                        m = re.search(r'RU=([^/]+)', href)
+                                        if m:
+                                            from urllib.parse import unquote
+                                            href = unquote(m.group(1))
+                                    
+                                    return href
+                    except Exception as e:
+                        log.debug(f"      ⚠️ Yahoo fallback failed: {e}")
+                
+                return None # Fallback to None if search fails
+
+            # Handle others
             # Random delay to be nice
             time.sleep(random.uniform(0.5, 1.5))
             
-            resp = session.get(url, timeout=10)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://google.com/',
+            }
+            
+            resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+            
+            # Anti-Bot 401/403 Handling
+            if resp.status_code in [401, 403]:
+                log.info(f"      🛡️ 401/403 blocked on {urlparse(url).netloc}, retrying with new headers...")
+                time.sleep(2)
+                headers['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+                headers['Referer'] = 'https://linkedin.com/'
+                resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+                
+                if resp.status_code in [401, 403]:
+                    log.warning(f"      ❌ Still blocked (401/403), safely skipping: {urlparse(url).netloc}")
+                    return None
+            
             if resp.status_code != 200:
                 return None
-            
+                
+            # If the redirect brought us to a completely new URL, check if that URL is valid
+            final_url = resp.url
+            if final_url and final_url != url:
+                # If it's a direct ATS link, we found the destination
+                from core.utils import is_valid_apply_url
+                if is_valid_apply_url(final_url):
+                    return final_url
+                # If the redirect led to a homepage or invalid URL, reject it
+                if any(x in final_url for x in ['jobright.ai', 'migratemate.co', 'simplify.jobs', 'github.com']):
+                    pass # Still an intermediary, need to parse HTML
+                else:
+                    return None # Redirected to an invalid non-ATS page
+
+            # If we are here, we might need to parse HTML for a portal link
             soup = BeautifulSoup(resp.text, 'html.parser')
             
             # Strategy 1: Look for common portals in the HTML
@@ -134,8 +214,8 @@ class LinkResolver:
                 if href.startswith('http') and 'jobright.ai' not in href and 'migratemate.co' not in href:
                     return href
                     
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"      ❌ Redirect resolution error: {e}")
         return None
 
 
@@ -199,6 +279,14 @@ class SimplifyScraper:
 
                     # Detect if it's an internship for engine-level filtering
                     is_intern = 'intern' in title.lower() or 'intern' in category.lower()
+
+                    # Reject empty or internal-only URLs at ingestion
+                    if not apply_url:
+                        continue
+                    # Block simplify.jobs internal redirects and github raw URLs
+                    apply_url_lower = apply_url.lower()
+                    if any(d in apply_url_lower for d in ['simplify.jobs', 'github.com/SimplifyJobs']):
+                        continue
 
                     jobs.append({
                         'source': f'Simplify/{repo}',
@@ -363,6 +451,9 @@ class JobrightScraper:
                         break
                 if not apply_link and md_links: apply_link = md_links[0]
 
+                if not apply_link:
+                    continue  # No URL at all — skip this row entirely
+
                 def clean_field(txt):
                     if not txt: return ""
                     txt = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', txt)
@@ -385,7 +476,7 @@ class JobrightScraper:
                 
                 source_id = hashlib.md5(f"{title}{company}{location}".lower().encode()).hexdigest()[:12]
                 jobs.append({
-                    'source': f'Jobright/{repo_name}',
+                    'source': 'Jobright',
                     'source_job_id': f"jr-{source_id}",
                     'title': title,
                     'company': company,
@@ -431,26 +522,25 @@ class MigrateMateScraper:
     Pages: /visa-sponsorship-jobs/h1b, /opt, /tn, etc.
     """
     CATEGORIES = [
-        ('h1b', 'H-1B'),
-        ('opt', 'OPT/CPT'),
-        ('tn', 'TN'),
-        ('green-card', 'Green Card'),
-        ('software-engineer', 'Software Engineer'),
-        ('mechanical-engineer', 'Mechanical Engineer'),
-        ('product-manager', 'Product Manager'),
-        ('marketing-manager', 'Marketing Manager'),
-        ('civil-engineer', 'Civil Engineer'),
-        ('data-analyst', 'Data Analyst'),
-        ('business-analyst', 'Business Analyst'),
-        ('finance-analyst', 'Finance Analyst'),
+        ('h1b-jobs', 'H-1B'),
+        ('opt-jobs', 'OPT/CPT'),
+        ('tn-jobs', 'TN'),
+        ('green-card-jobs', 'Green Card'),
+        ('h1b-jobs/software-engineer', 'Software Engineer'),
+        ('h1b-jobs/mechanical-engineer', 'Mechanical Engineer'),
+        ('h1b-jobs/product-manager', 'Product Manager'),
+        ('h1b-jobs/marketing-manager', 'Marketing Manager'),
+        ('h1b-jobs/civil-engineer', 'Civil Engineer'),
+        ('h1b-jobs/data-analyst', 'Data Analyst'),
+        ('h1b-jobs/business-analyst', 'Business Analyst'),
+        ('h1b-jobs/finance-analyst', 'Finance Analyst'),
     ]
 
     def fetch(self, query=None):
-        jobs = []
-        # ULTRA-STEALTH: Only scrape ONE category per sync run to be 100% invisible.
-        # This prevents MigrateMate's firewall from seeing "bursty" behavior.
+        all_jobs = []
+        # Increase to 3 categories per pass for better coverage
         import random
-        slug, cat_name = random.choice(self.CATEGORIES)
+        selected_cats = random.sample(self.CATEGORIES, min(3, len(self.CATEGORIES)))
         
         # Select ONE persistent identity for this sync cycle
         ua = random.choice(USER_AGENTS)
@@ -458,122 +548,126 @@ class MigrateMateScraper:
         establishment_scraper.headers.update({'User-Agent': ua})
         
         try:
-            log.info(f"    🏢 Stealth Warmup for {cat_name}...")
-            # Step 1: Human-like landing (REDUCED TIMEOUT)
-            establishment_scraper.get("https://migratemate.co/", timeout=10)
-            time.sleep(3) 
+            log.info(f"    🏢 Stealth Warmup for MigrateMate...")
+            # Step 1: Human-like landing
+            establishment_scraper.get("https://migratemate.co/h1b-jobs", timeout=30)
+            time.sleep(2) 
         except:
             pass
 
-        try:
-            url = f"https://migratemate.co/visa-sponsorship-jobs/{slug}"
-            log.info(f"    📥 Single-Drip Fetch: {cat_name}")
-            
-            resp = establishment_scraper.get(url, timeout=10, headers={
-                'Referer': 'https://migratemate.co/',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-                'Upgrade-Insecure-Requests': '1',
-            })
-            
-            if resp.status_code != 200:
-                log.warning(f"    ⚠️ MigrateMate {slug} block ({resp.status_code}). Next sync will retry a different category.")
-                return []
+        for slug, cat_name in selected_cats:
+            try:
+                url = f"https://migratemate.co/{slug}"
+                log.info(f"    📥 Single-Drip Fetch: {cat_name}")
+                
+                resp = establishment_scraper.get(url, timeout=30, headers={
+                    'Referer': 'https://migratemate.co/h1b-jobs',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'same-origin',
+                    'Upgrade-Insecure-Requests': '1',
+                })
+                
+                if resp.status_code != 200:
+                    log.warning(f"    ⚠️ MigrateMate {slug} block ({resp.status_code}).")
+                    continue
 
-            parsed = self._parse_html(resp.text, cat_name)
-            jobs.extend(parsed)
-            
-            log.info(f"    ← Stealth success ({cat_name}): {len(parsed)} jobs")
+                parsed = self._parse_html(resp.text, cat_name, slug)
+                all_jobs.extend(parsed)
+                
+                log.info(f"    ← Stealth success ({cat_name}): {len(parsed)} jobs")
+                time.sleep(random.uniform(2, 5)) # Delay between categories
+            except Exception as e:
+                log.error(f"    ❌ MigrateMate error in {cat_name}: {e}")
 
-        except Exception as e:
-            log.error(f"    ❌ MigrateMate stealth error: {e}")
+        return all_jobs
 
-        return jobs
-
-    def _parse_html(self, html, visa_type):
-        """Parse MigrateMate job listing HTML based on updated structure."""
+    def _parse_html(self, html, visa_type, slug):
+        """
+        Parse MigrateMate job listing HTML using JSON-LD (Schema.org) structured data.
+        This is 100% reliable even if the React-based SPA structure changes.
+        """
+        import json
+        import hashlib
         jobs = []
         soup = BeautifulSoup(html, 'html.parser')
 
-        # Updated selector: Job cards are rounded-xl containers
-        cards = soup.select('div.rounded-xl')
-        if not cards:
-            # Fallback to older selector if structure varies
-            cards = soup.select('a[href*="/jobs/"], .job-card')
-
-        for card in cards:
+        # Find the JSON-LD ItemList script
+        scripts = soup.find_all('script', type='application/ld+json')
+        found_data = False
+        
+        for s in scripts:
             try:
-                # The site uses a flex structure: logo then a text div
-                # text_container = card.find('div', class_=re.compile(r'flex.*flex-col'))
-                # Based on browser agent: card -> flex -> div(logo), div(text)
+                # Use .text instead of .string to avoid None issues if there are comments inside script tag
+                script_content = s.text.strip()
+                if not script_content: continue
                 
-                # Heuristic: find the div with most text that isn't the whole card
-                text_divs = card.find_all('div', recursive=False)
-                if len(text_divs) >= 2:
-                    content_div = text_divs[1]
-                else:
-                    content_div = card
-
-                # According to browser agent report: 
-                # Company: :nth-child(1), Title: :nth-child(2), Location: :nth-child(3)
-                inner_divs = content_div.find_all('div', recursive=False)
+                data = json.loads(script_content)
                 
-                # Check for date (e.g. "2h ago", "1d ago")
-                # Usually sits at the bottom or top of the content_div
-                date_val = None
-                card_text = card.get_text(separator=' ', strip=True)
-                posted_date = self._parse_time_ago(card_text)
+                # MigrateMate stores jobs in an ItemList graph
+                if isinstance(data, dict) and data.get('@type') == 'ItemList':
+                    elements = data.get('itemListElement', [])
+                    for element in elements:
+                        item = element.get('item', {})
+                        if item.get('@type') == 'JobPosting':
+                            title = item.get('title', '').strip()
+                            company_info = item.get('hiringOrganization', {})
+                            company = company_info.get('name', 'Unknown').strip()
+                            
+                            # Location
+                            loc_info = item.get('jobLocation', {})
+                            if isinstance(loc_info, list) and loc_info:
+                                loc_info = loc_info[0]
+                            
+                            address = loc_info.get('address', {})
+                            if isinstance(address, dict):
+                                city = address.get('addressLocality', '')
+                                state = address.get('addressRegion', '')
+                                location = f"{city}, {state}".strip(', ') or 'USA'
+                            else:
+                                location = 'USA'
 
-                if len(inner_divs) >= 2:
-                    company = inner_divs[0].get_text(strip=True)
-                    title = inner_divs[1].get_text(strip=True)
-                    location = inner_divs[2].get_text(strip=True) if len(inner_divs) > 2 else 'USA'
-                else:
-                    # Fallback to basic text search
-                    full_text = card.get_text(separator='|', strip=True)
-                    parts = full_text.split('|')
-                    if len(parts) >= 2:
-                        company = parts[0]
-                        title = parts[1]
-                        location = parts[2] if len(parts) > 2 else 'USA'
-                    else:
-                        continue
-
-                # Get the link - typically the card itself is wrapped in an 'a' or contains one
-                link_tag = card.find('a') if card.name != 'a' else card
-                if link_tag:
-                    href = link_tag.get('href', '')
-                    apply_link = href if href.startswith('http') else f"https://migratemate.co{href}"
-                else:
-                    continue
-
-                if not title or len(title) < 3:
-                    continue
-
-                # Stable ID using MD5 (Python's hash() is unstable across processes)
-                raw_id = f"mm-{company}-{title}".lower()
-                stable_id = hashlib.md5(raw_id.encode()).hexdigest()[:12]
-
-                jobs.append({
-                    'source': 'MigrateMate',
-                    'source_job_id': f"mm-{stable_id}",
-                    'title': title,
-                    'company': company or 'Unknown',
-                    'location': location or 'USA',
-                    'description': f"{title} at {company}. Category: {visa_type}. Source: MigrateMate.co",
-                    'external_apply_link': apply_link,
-                    'employment_type': 'Full-time',
-                    'salary_range': '',
-                    'company_logo': '',
-                    'posted_date': posted_date,
-                    'visa_type': visa_type if visa_type in ['H-1B', 'OPT/CPT', 'TN', 'Green Card'] else 'Visa',
-                })
+                            # Apply URL fallback to the category page if missing
+                            apply_url = item.get('url', '')
+                            if not apply_url:
+                                apply_url = f"https://migratemate.co/{slug}"
+                            
+                            # Date Posted - CRITICAL for engine filtering
+                            raw_date = item.get('datePosted')
+                            posted_dt = self._parse_iso_date(raw_date)
+                            
+                            if title and company and apply_url:
+                                source_id = hashlib.md5(f"{title}{company}{apply_url}".lower().encode()).hexdigest()[:12]
+                                jobs.append({
+                                    'source': 'MigrateMate',
+                                    'source_job_id': f"mm-{source_id}",
+                                    'title': title,
+                                    'company': company,
+                                    'location': location,
+                                    'description': item.get('description', f"{title} at {company}. Source: MigrateMate"),
+                                    'external_apply_link': apply_url,
+                                    'employment_type': 'Full-time',
+                                    'visa_type': visa_type if visa_type in ['H-1B', 'OPT/CPT', 'TN', 'Green Card'] else 'Visa',
+                                    'posted_date': posted_dt
+                                })
+                                found_data = True
+                
+                if found_data: break
             except Exception as e:
+                log.debug(f"      ⚠ JSON-LD parse error: {e}")
                 continue
 
+        if not jobs:
+            html_snippet = html[:500].lower()
+            if not html.strip():
+                log.warning("    ⚠️ MigrateMate returned EMPTY HTML (Bot block suspected). Skipping.")
+            elif 'cloudflare' in html_snippet or 'datadome' in html_snippet:
+                log.warning("    🛡️ MigrateMate bot-protection challenge detected.")
+            else:
+                log.warning(f"    ⚠️ MigrateMate JSON-LD not found. Structure may have changed.")
+            
         return jobs
 
     def _parse_time_ago(self, text):
@@ -599,3 +693,17 @@ class MigrateMateScraper:
             return now - timedelta(days=val * 365)
         
         return None
+
+    def _parse_iso_date(self, date_str):
+        """Parse ISO date string into aware datetime."""
+        if not date_str:
+            # Fallback: if no date, assume today to pass 24h filter
+            return datetime.now(tz=tz.utc)
+        try:
+            from dateutil.parser import parse
+            dt = parse(date_str)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=tz.utc)
+            return dt
+        except:
+            return datetime.now(tz=tz.utc)

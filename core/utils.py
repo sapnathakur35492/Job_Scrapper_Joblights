@@ -155,15 +155,306 @@ def is_direct_link(url):
     blocked_domains = [
         'linkedin.com', 'glassdoor.com', 'indeed.com', 'ziprecruiter.com', 'monster.com',
         'crunchbase.com', 'prnewswire.com', 'businesswire.com', 'facebook.com', 'twitter.com',
-        'x.com', 'instagram.com', 'decrypt.co', 'alleywatch.com'
+        'x.com', 'instagram.com', 'decrypt.co', 'alleywatch.com',
+        'jobright.ai', 'simplify.jobs', 'migratemate.co', 'github.com',
+        'yahoo.com',
     ]
     for domain in blocked_domains:
         if domain in url.lower():
             return False
     return True
 
-def generate_job_hash(title, company, location):
-    data = f"{title}|{company}|{location}".lower().strip()
+def is_valid_apply_url(url):
+    """Strict validation: URL must be a specific job application page.
+    Rejects homepages, aggregators, news sites, and generic career landing pages.
+    This is the FINAL gate before saving a job to the database."""
+    if not url or not url.startswith('http'):
+        return False
+
+    parsed = urlparse(url)
+    path = parsed.path.rstrip('/')
+    netloc = parsed.netloc.lower()
+
+    # 1. Block aggregator/intermediary domains
+    blocked = [
+        'jobright.ai', 'simplify.jobs', 'migratemate.co', 'github.com',
+        'linkedin.com', 'glassdoor.com', 'glassdoor.ca', 'indeed.com', 'ziprecruiter.com',
+        'monster.com', 'facebook.com', 'twitter.com', 'x.com',
+        'instagram.com', 'youtube.com', 'medium.com', 'crunchbase.com',
+        'prnewswire.com', 'businesswire.com', 'yahoo.com', 'nofluffjobs.com',
+        'bayt.com', 'glich.co', 'cryptojobs.com', 'nextleap.app',
+        'myjobmag', 'theladders.com', 'remoteml.com', 'agenticcareers.co',
+        'wellfound.com', 'themuse.com', 'builtin.com', 'ycombinator.com',
+        'dice.com', 'careerbuilder.com', 'simplyhired.com', 'angel.co',
+        'uaetopjobs.com', 'unatlas.org', 'nodeflair.com', 'foundit.my',
+        'wizbii.com', 'apple.com/careers/hk/en/life-at-apple' # Apple life page is not a job
+    ]
+    if any(d in netloc for d in blocked) or netloc.endswith('.edu'):
+        return False
+    # Block google.com search but allow careers.google.com (Google's own ATS)
+    if 'google.com' in netloc and not netloc.startswith('careers.'):
+        return False
+
+    # 2. Block news/blog sites
+    news_domains = [
+        'techcrunch', 'forbes', 'bloomberg', 'reuters', 'venturebeat',
+        'businessinsider', 'theverge', 'wired', 'zdnet',
+    ]
+    if any(n in netloc for n in news_domains):
+        return False
+    if any(p in path for p in ['/article/', '/press/', '/blog/', '/news/', '/story/']):
+        return False
+
+    # 3. Block generic file resources
+    if any(path.endswith(ext) for ext in ['.png', '.jpg', '.svg', '.gif', '.css', '.js', '.pdf']):
+        return False
+
+    # Check for specific ID patterns (numbers, UUIDs, mixed alphanumeric slugs)
+    has_identifier_regex = bool(re.search(r'[0-9]{4,}|[a-f0-9]{8,}-[a-f0-9]{4}-', path.lower()))
+
+    # 4. Block homepage-only URLs (no meaningful path)
+    if not path or path == '/' or path.count('/') == 0:
+        return False
+
+    # 5. Block generic career landing pages (not job-specific)
+    generic_paths = ['/careers', '/jobs', '/about', '/company', '/career', '/join', '/work', '/openings']
+    if any(path.endswith(p) for p in generic_paths) and not has_identifier_regex:
+        return False
+
+    # 6. Block login and dashboard pages
+    login_paths = ['/login', '/signin', '/auth', '/dashboard', '/user', '/account']
+    if any(lp in path.lower() for lp in login_paths):
+        return False
+
+    # 7. STRICT ATS VALIDATION: Must have a job identifier OR be a known ATS
+    # Known ATS domains that inherently represent jobs when not blocked above
+    known_ats = [
+        'greenhouse.io', 'lever.co', 'workday.com', 'myworkdayjobs.com',
+        'ashbyhq.com', 'icims.com', 'smartrecruiters.com', 'breezy.hr',
+        'bamboohr.com', 'freshteam.com', 'workable.com', 'jobvite.com'
+    ]
+    is_known_ats = any(ats in netloc for ats in known_ats)
+
+    # Job-specific identifiers in the path or query
+    job_identifiers = [
+        '/job/', '/jobs/', '/posting/', '/viewjob', '/apply', 
+        'reqid', 'requisition', 'jobid', 'job_id'
+    ]
+    url_lower = url.lower()
+    has_identifier = any(ji in url_lower for ji in job_identifiers)
+
+    # If it's not a known ATS and doesn't have a clear job identifier, reject
+    if not is_known_ats and not has_identifier and not has_identifier_regex:
+        return False
+
+    return True
+
+def is_live_apply_url(url, expected_company='', expected_title=''):
+    """
+    Active verification: Send an HTTP GET to ensure the URL is alive (200 OK)
+    and does not contain text indicating the job is expired/closed.
+    Uses Django caching to avoid repeated hits and BeautifulSoup to avoid false positives.
+    """
+    from django.core.cache import cache
+    import requests
+    import urllib3
+    from bs4 import BeautifulSoup
+    import hashlib
+    urllib3.disable_warnings()
+
+    # 1. Check cache first (24h TTL)
+    # Include company and title in cache key so that generic redirects don't poison correct job checks
+    cache_str = f"{url}_{expected_company}_{expected_title}"
+    cache_key = f"live_check_{hashlib.md5(cache_str.encode()).hexdigest()}"
+    cached_result = cache.get(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    }
+    
+    try:
+        # 2. Strict 4-second timeout to avoid hanging the scraper
+        resp = requests.get(url, headers=headers, timeout=4, allow_redirects=True, verify=False)
+        if resp.status_code != 200:
+            cache.set(cache_key, False, 86400) # Cache failures for 24h
+            return False
+            
+        # 3. Check for soft 404s (expired job pages that return 200)
+        text = resp.text.lower()
+        soft_404_phrases = [
+            'job not found', 'page not found', 'no longer available', 
+            'position has been closed', 'job has expired', 'this job is no longer active',
+            'job is closed', '404 not found', "doesn't exist", "does not exist",
+            "couldn't find that job", "link you followed is broken"
+        ]
+        
+        # Workday specific 404 detection (often returns 200 with specific clip-art or text)
+        is_workday = 'myworkdayjobs.com' in url
+        if is_workday:
+            if "looking for doesn't exist" in text or "search for jobs" in text and len(text) < 10000:
+                # Workday 404s are usually small pages with a search button
+                if not expected_title.lower() in text:
+                    return False
+
+        if any(phrase in text for phrase in soft_404_phrases):
+            # Potential soft-404. Let's do a false-positive check.
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Check if there is an actual application form or apply button on the page
+            forms = soup.find_all('form')
+            # Stricter apply button check: must contain 'apply' but NOT 'search'
+            apply_buttons = soup.find_all(['a', 'button'], string=lambda s: s and 'apply' in s.lower() and 'search' not in s.lower())
+            
+            if not forms and not apply_buttons:
+                # Confirmed soft-404
+                cache.set(cache_key, False, 86400)
+                return False
+                
+        # ══════════════════════════════════════════════════
+        # 4. JOB IDENTITY VERIFICATION LAYER
+        # ══════════════════════════════════════════════════
+        if expected_company or expected_title:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Extract plain text
+            page_text = soup.get_text(separator=' ', strip=True).lower()
+            
+            # ══════════════════════════════════════════════════
+            #  TRUE 24-HOUR ATS FRESHNESS CHECK
+            # ══════════════════════════════════════════════════
+            # Check for explicitly stale dates on the ATS itself
+            import re
+            
+            # Pattern 1: "Posted X Days Ago" where X > 1
+            stale_days_match = re.search(r'posted\s+(\d+)\s+days?\s+ago', page_text)
+            if stale_days_match:
+                days = int(stale_days_match.group(1))
+                if days > 1:
+                    print(f"    [STALE ATS] Job posted {days} days ago. Rejecting.")
+                    cache.set(cache_key, False, 86400)
+                    return False
+            
+            # Pattern 2: "Posted 30+ Days Ago" or similar text forms
+            stale_phrases = [
+                r'30\+\s+days\s+ago',
+                r'posted\s+a\s+month\s+ago',
+                r'posted\s+over\s+a\s+month\s+ago',
+                r'posted\s+[2-9]\s+weeks\s+ago',
+                r'posted\s+\d{2,}\s+weeks\s+ago',
+                r'posted\s+\d+\s+months?\s+ago'
+            ]
+            for phrase in stale_phrases:
+                if re.search(phrase, page_text):
+                    print(f"    [STALE ATS] Job posted very long ago (matched {phrase}). Rejecting.")
+                    cache.set(cache_key, False, 86400)
+                    return False
+            
+            # Look for JSON-LD datePosted
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if script.string:
+                    page_text += " " + script.string.lower()
+                    
+            # Extract Meta tags
+            metas = soup.find_all('meta')
+            for meta in metas:
+                if meta.get('content'):
+                    page_text += " " + meta.get('content').lower()
+
+            # Pattern 3: JSON-LD datePosted or meta date
+            # Since page_text is lowercase, check for "dateposted": "2024-..."
+            date_posted_match = re.search(r'"dateposted"\s*:\s*"([^"]+)"', page_text)
+            print("DATE POSTED MATCH:", date_posted_match)
+            if date_posted_match:
+                date_str = date_posted_match.group(1)
+                try:
+                    from datetime import datetime, timezone as tz
+                    from django.utils import timezone
+                    import dateutil.parser
+                    
+                    dt = dateutil.parser.parse(date_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=tz.utc)
+                    diff = (timezone.now() - dt).total_seconds()
+                    if diff > 172800: # 48 hours (Increased to 48h to be safe)
+                        print(f"    [STALE ATS] JSON-LD datePosted > 48h. Rejecting.")
+                        try:
+                            cache.set(cache_key, False, 86400)
+                        except Exception: pass
+                        return False
+                except Exception as e:
+                    print(f"ERROR: {e}")
+
+            score = 0
+            
+            # Check ATS Domain (Known direct paths get base confidence)
+            known_ats = ['greenhouse.io', 'lever.co', 'workday.com', 'myworkdayjobs.com', 'ashbyhq.com']
+            if any(ats in url.lower() for ats in known_ats):
+                score += 20
+                
+            # Job ID presence in URL or text (Heuristic: usually numbers or UUID)
+            # If the URL contains numbers/sluggified paths
+            if re.search(r'/[0-9]{4,}|/[a-f0-9]{8,}', url.lower()):
+                score += 10
+                
+            # Company Fuzzy Match
+            if expected_company:
+                comp_norm = re.sub(r'[^a-z0-9]', '', expected_company.lower())
+                # also check first word (e.g. 'Google LLC' -> 'google')
+                comp_first = expected_company.lower().split()[0]
+                comp_first_norm = re.sub(r'[^a-z0-9]', '', comp_first)
+                
+                if (len(comp_norm) > 2 and comp_norm in page_text) or \
+                   (len(comp_first_norm) > 2 and comp_first_norm in page_text):
+                    score += 40
+            else:
+                score += 40 # Pass if not provided
+                
+            # Title Fuzzy Match
+            if expected_title:
+                # Remove punctuation and split into words
+                title_clean = re.sub(r'[^a-z0-9\s]', '', expected_title.lower())
+                title_words = [w for w in title_clean.split() if len(w) > 2]
+                
+                if title_words:
+                    # Check how many words match
+                    matched_words = sum(1 for w in title_words if w in page_text)
+                    match_ratio = matched_words / len(title_words)
+                    
+                    if match_ratio >= 0.5: # At least half the meaningful words present
+                        score += 30
+                    elif match_ratio > 0:
+                        score += 15
+            else:
+                score += 30 # Pass if not provided
+
+            # FINAL THRESHOLD CHECK
+            if score < 70: # Back to 70, but we now have better soft-404 detection above
+                # Identity check failed
+                cache.set(cache_key, False, 86400)
+                return False
+                
+        cache.set(cache_key, True, 86400)
+        return True
+    except Exception:
+        # Timeout or connection error -> assume dead/blocked
+        cache.set(cache_key, False, 86400)
+        return False
+
+def generate_job_hash(company, title, location, apply_url=''):
+    """Generate dedup hash. Includes normalized apply URL for cross-source accuracy."""
+    url_key = ''
+    if apply_url:
+        try:
+            p = urlparse(apply_url)
+            url_key = (p.netloc + p.path).lower().rstrip('/')
+        except Exception:
+            url_key = apply_url.lower()
+    data = f"{title}|{company}|{location}|{url_key}".lower().strip()
     return hashlib.md5(data.encode()).hexdigest()
 
 def extract_job_metadata(title, desc):

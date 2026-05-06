@@ -37,11 +37,27 @@ def dashboard(request):
     today_jobs = Job.objects.filter(created_at__gte=today_start).count()
 
     # Source breakdown
-    sources = (
+    raw_sources = (
         Job.objects.values('source')
         .annotate(count=Count('id'))
         .order_by('-count')
     )
+    
+    source_counts = {}
+    for rs in raw_sources:
+        s_name = rs['source'] or 'Unknown'
+        if 'Jobright' in s_name:
+            base_name = 'Jobright'
+        elif 'Simplify' in s_name:
+            base_name = 'Simplify'
+        elif 'MigrateMate' in s_name:
+            base_name = 'MigrateMate'
+        else:
+            base_name = s_name.split('/')[0]
+            
+        source_counts[base_name] = source_counts.get(base_name, 0) + rs['count']
+        
+    sources = [{'source': k, 'count': v} for k, v in sorted(source_counts.items(), key=lambda x: x[1], reverse=True)]
 
     # Recent jobs
     recent_jobs = Job.objects.order_by('-created_at')[:15]
@@ -80,7 +96,7 @@ def job_list(request):
     # Filter by source
     source_filter = request.GET.get('source', '')
     if source_filter:
-        jobs = jobs.filter(source=source_filter)
+        jobs = jobs.filter(source__istartswith=source_filter)
 
     # Filter by visa type
     visa_filter = request.GET.get('visa', '')
@@ -97,11 +113,7 @@ def job_list(request):
         jobs = jobs.filter(is_archived=True)
 
     # Available sources for filter dropdown
-    available_sources = (
-        Job.objects.values_list('source', flat=True)
-        .distinct()
-        .order_by('source')
-    )
+    available_sources = ['Jobright', 'MigrateMate', 'Simplify']
 
     paginator = Paginator(jobs, 20)
     page_number = request.GET.get('page', 1)

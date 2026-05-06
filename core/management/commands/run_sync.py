@@ -21,8 +21,7 @@ class Command(BaseCommand):
 
         def sync_task():
             self.stdout.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Triggering sync...")
-            engine.run_sync(query=query)
-            engine.remove_expired_jobs()
+            engine.run_sync()
 
         # Run immediately on start
         sync_task()

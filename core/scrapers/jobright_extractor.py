@@ -13,6 +13,7 @@ import logging
 import hashlib
 import random
 from urllib.parse import urlparse, parse_qs, unquote
+import urllib.parse
 
 import cloudscraper
 import requests
@@ -78,27 +79,42 @@ def _is_valid_job_url(url):
     # STRICT MODE: Block generic ATS roots and career pages if they don't look like a specific job path
     parsed = urlparse(url)
     path = parsed.path.rstrip('/')
-    
+
+    # Check if path has a job-specific identifier (UUID, numeric ID, slug)
+    has_identifier = bool(re.search(r'[a-f0-9]{8,}|/\d{4,}|/[a-z0-9]+-[a-z0-9]+-[a-z0-9]+', path.lower()))
+
     # If the path is just empty or very short, it's a homepage/board, not a job
     if not path or path == '/' or path == '/careers' or path == '/jobs' or path == '/about' or path == '/company':
         return False
 
-    # Block support and help articles from ATS
-    if 'support.greenhouse.io' in u or 'help.lever.co' in u or 'support.workday.com' in u:
-        return False
+    # Strict Subdomain Validation for ATS systems
+    if 'greenhouse.io' in parsed.netloc:
+        if 'boards.greenhouse.io' not in parsed.netloc and 'job-boards.greenhouse.io' not in parsed.netloc:
+            return False
+        if '/jobs/' not in path and '/job/' not in path and not has_identifier:
+            return False
 
-    # Reject generic job boards (they need an ID or slug)
-    # Check if the path contains numbers, dashes (slugs), or UUIDs
-    has_identifier = bool(re.search(r'\d+|-[a-z0-9]+-[a-z0-9]+', path))
+    if 'lever.co' in parsed.netloc:
+        if 'jobs.lever.co' not in parsed.netloc and 'hire.lever.co' not in parsed.netloc:
+            return False
+        if not has_identifier:
+            return False
 
-    if 'lever.co' in parsed.netloc and not has_identifier:
-        return False
-    if 'greenhouse.io' in parsed.netloc and ('/jobs/' not in path and '/job/' not in path and not has_identifier):
-        return False
-    if 'workdayjobs.com' in parsed.netloc and '/job/' not in path:
-        return False
-    if 'bamboohr.com' in parsed.netloc and '/careers/' not in path and not has_identifier:
-        return False
+    if 'workdayjobs.com' in parsed.netloc or 'workday.com' in parsed.netloc:
+        if 'myworkdayjobs.com' not in parsed.netloc:
+            return False
+        if parsed.netloc.startswith('www.'):
+            return False
+        if '/job/' not in path:
+            return False
+
+    if 'ashbyhq.com' in parsed.netloc:
+        if 'jobs.ashbyhq.com' not in parsed.netloc:
+            return False
+
+    if 'bamboohr.com' in parsed.netloc:
+        if '/careers/' not in path and not has_identifier:
+            return False
 
     return True
 
@@ -550,7 +566,7 @@ class JobrightURLExtractor:
         for query in queries:
             for attempt in range(2):  # Max 2 retries per query
                 try:
-                    result = self._web_search(query)
+                    result = self._web_search(query, clean_company)
                     if result:
                         log.info(f"    🔍 Search hit via: {query[:60]}")
                         return result
@@ -560,39 +576,36 @@ class JobrightURLExtractor:
                     time.sleep(random.uniform(1, 2))
                     continue
 
-        # ── Step 5 Fallback: Use company URL as last resort ──
-        # When ATS search fails but we have the company's careers page URL,
-        # return the company homepage as the apply destination.
-        if company_url:
-            log.info(f"    🏢 Using company homepage as fallback apply URL: {company_url}")
-            # Build likely careers page URL
-            careers_candidates = [
-                company_url.rstrip('/') + '/careers',
-                company_url.rstrip('/') + '/jobs',
-                company_url.rstrip('/') + '/career',
-            ]
-            # Try each careers URL via a quick HTTP check
-            for careers_url in careers_candidates:
-                try:
-                    r = self.scraper.head(careers_url, timeout=3, allow_redirects=True)
-                    if r.status_code < 400:
-                        log.info(f"    ✅ Careers page confirmed: {careers_url}")
-                        return careers_url
-                except Exception:
-                    continue
-            # If none respond, return base company URL
-            return company_url
+        # ── Step 5 Fallback: REMOVED ──
+        # Previously returned company homepages (e.g. spacex.com/careers) as apply links.
+        # This violated the strict rule: only specific job application pages are acceptable.
+        # If no ATS link found via search, this job must be skipped entirely.
 
         return None
 
-    def _web_search(self, query):
+    def _web_search(self, query, company=None):
         """Perform a web search to find the ATS link, using multiple engines for reliability."""
+        
+        def _is_url_for_company(url, comp):
+            if not comp: return True
+            # Strip non-alphanumeric and lowercase to match typical ATS slugs
+            comp_slug = re.sub(r'[^a-z0-9]', '', comp.lower())
+            url_lower = url.lower()
+            if len(comp_slug) >= 3 and comp_slug in url_lower:
+                return True
+            # Also try first word of company if it's distinctive (e.g. "Apex Capital" -> "apex")
+            first_word = comp.lower().split()[0]
+            first_word_slug = re.sub(r'[^a-z0-9]', '', first_word)
+            if len(first_word_slug) >= 4 and first_word_slug in url_lower:
+                return True
+            return False
+
         # 1. Try Google Search first (via googlesearch-python)
         try:
             from googlesearch import search
             for url in search(query, num_results=5, sleep_interval=1):
                 if not url: continue
-                if _is_valid_job_url(url):
+                if _is_valid_job_url(url) and _is_url_for_company(url, company):
                     if _is_ats_url(url) or any(kw in url.lower() for kw in ['/job/', '/jobs/', '/apply', '/careers/', '/posting/']):
                         return url
         except Exception as e:
@@ -600,17 +613,27 @@ class JobrightURLExtractor:
 
         # 2. Try Custom Yahoo Search (Very reliable, rarely rate-limits)
         try:
-            url = 'https://search.yahoo.com/search?p=' + urllib.parse.quote(query)
-            resp = self.scraper.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'})
+            search_url = 'https://search.yahoo.com/search?p=' + urllib.parse.quote(query)
+            resp = self.scraper.get(search_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'})
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 for a in soup.find_all('a', href=True):
                     href = a['href']
-                    # Yahoo wraps URLs in a redirect like: /RU=https%3a%2f%2fcareers.com/...
+                    # Yahoo wraps URLs as: ...RU=https%3a%2f%2fcareers.com%2fjob%2f123/RK=...
                     if 'RU=' in href:
                         try:
-                            extracted_url = urllib.parse.unquote(href.split('RU=')[1].split('/')[0])
-                            if _is_valid_job_url(extracted_url):
+                            # Extract between RU= and /RK= (the actual destination URL)
+                            ru_part = href.split('RU=')[1]
+                            # Split on /RK= to get just the URL part
+                            if '/RK=' in ru_part:
+                                ru_part = ru_part.split('/RK=')[0]
+                            elif '/RS=' in ru_part:
+                                ru_part = ru_part.split('/RS=')[0]
+                            extracted_url = urllib.parse.unquote(ru_part)
+                            # Skip any yahoo.com internal links
+                            if 'yahoo.com' in extracted_url.lower():
+                                continue
+                            if _is_valid_job_url(extracted_url) and _is_url_for_company(extracted_url, company):
                                 if _is_ats_url(extracted_url) or any(kw in extracted_url.lower() for kw in ['/job/', '/jobs/', '/apply', '/careers/', '/posting/']):
                                     log.info(f"    🔍 Yahoo hit: {extracted_url[:60]}")
                                     return extracted_url
@@ -630,7 +653,7 @@ class JobrightURLExtractor:
                 results = list(ddgs.text(query, max_results=5))
                 for res in results:
                     url = res.get('href')
-                    if url and _is_valid_job_url(url):
+                    if url and _is_valid_job_url(url) and _is_url_for_company(url, company):
                         if _is_ats_url(url) or any(kw in url.lower() for kw in ['/job/', '/jobs/', '/apply', '/careers/', '/posting/']):
                             return url
         except Exception as e:
