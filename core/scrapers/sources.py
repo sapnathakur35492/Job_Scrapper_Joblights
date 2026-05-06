@@ -113,50 +113,60 @@ class LinkResolver:
                     return result.get('final_url')
                 return None
                 
-            # Handle MigrateMate links via DuckDuckGo Search Fallback
+            # Handle MigrateMate links via DuckDuckGo/Yahoo Search
             if 'migratemate.co' in url and isinstance(job, dict):
                 title = job.get('title', '')
                 company = job.get('company', '')
                 if title and company:
-                    search_query = f"{title} {company} careers apply"
-                    try:
-                        try:
-                            from ddgs import DDGS
-                        except ImportError:
-                            from duckduckgo_search import DDGS
-
-                        with DDGS() as ddgs:
-                            results = list(ddgs.text(search_query, max_results=5))
-                            for res in results:
-                                res_url = res.get('href', '')
-                                if any(portal in res_url.lower() for portal in cls.COMMON_PORTALS):
-                                    return res_url
-                    except Exception as e:
-                        log.debug(f"      ⚠️ DDG failed, trying Yahoo: {e}")
+                    # Priority order: ATS-site-specific → general careers
+                    search_queries = [
+                        f'site:greenhouse.io OR site:lever.co OR site:myworkdayjobs.com OR site:ashbyhq.com "{company}" "{title}"',
+                        f'"{title}" "{company}" site:greenhouse.io OR site:lever.co OR site:workday.com',
+                        f'{title} {company} careers apply job',
+                    ]
                     
-                    # Fallback to Custom Yahoo Search
-                    try:
-                        import urllib.parse
-                        query_plus = f'site:greenhouse.io OR site:lever.co OR site:workday.com OR site:ashbyhq.com "{title}" "{company}"'
-                        yahoo_url = f"https://search.yahoo.com/search?p={urllib.parse.quote(query_plus)}"
-                        resp = session.get(yahoo_url, timeout=10)
-                        if resp.status_code == 200:
-                            soup = BeautifulSoup(resp.text, 'html.parser')
-                            for a in soup.find_all('a', href=True):
-                                href = a['href']
-                                if any(portal in href.lower() for portal in cls.COMMON_PORTALS):
-                                    # Basic URL cleaning (Yahoo often wraps links)
-                                    if 'r.search.yahoo.com' in href:
-                                        m = re.search(r'RU=([^/]+)', href)
-                                        if m:
-                                            from urllib.parse import unquote
-                                            href = unquote(m.group(1))
-                                    
-                                    return href
-                    except Exception as e:
-                        log.debug(f"      ⚠️ Yahoo fallback failed: {e}")
+                    for search_query in search_queries:
+                        # Try DDG first
+                        try:
+                            try:
+                                from ddgs import DDGS
+                            except ImportError:
+                                from duckduckgo_search import DDGS
+
+                            with DDGS() as ddgs:
+                                results = list(ddgs.text(search_query, max_results=8))
+                                for res in results:
+                                    res_url = res.get('href', '')
+                                    if any(portal in res_url.lower() for portal in cls.COMMON_PORTALS):
+                                        log.info(f"      🎯 DDG found ATS for {company}: {res_url[:60]}")
+                                        return res_url
+                        except Exception as e:
+                            log.debug(f"      ⚠️ DDG failed: {e}")
+                        
+                        # Yahoo Search fallback
+                        try:
+                            import urllib.parse
+                            yahoo_url = f"https://search.yahoo.com/search?p={urllib.parse.quote(search_query)}"
+                            resp = session.get(yahoo_url, timeout=12)
+                            if resp.status_code == 200:
+                                soup = BeautifulSoup(resp.text, 'html.parser')
+                                for a in soup.find_all('a', href=True):
+                                    href = a['href']
+                                    # Yahoo wraps: RU=https%3a%2f%2fboards.greenhouse.io.../RK=...
+                                    if 'RU=' in href:
+                                        try:
+                                            ru = href.split('RU=')[1].split('/RK=')[0].split('/RS=')[0]
+                                            href = urllib.parse.unquote(ru)
+                                        except Exception:
+                                            pass
+                                    if href.startswith('http') and 'yahoo.com' not in href:
+                                        if any(portal in href.lower() for portal in cls.COMMON_PORTALS):
+                                            log.info(f"      🎯 Yahoo found ATS for {company}: {href[:60]}")
+                                            return href
+                        except Exception as e:
+                            log.debug(f"      ⚠️ Yahoo fallback failed: {e}")
                 
-                return None # Fallback to None if search fails
+                return None  # All searches failed
 
             # Handle others
             # Random delay to be nice
@@ -494,23 +504,37 @@ class JobrightScraper:
     def _parse_date(self, date_str):
         if not date_str:
             return None
-        date_str = date_str.strip(' *')
+        date_str = re.sub(r'[*\u2605]', '', date_str).strip()
         try:
-            # 1. Try "2026-04-25" format
+            # 1. Try "2026-04-25" or "2026-05-06" ISO format
             if re.match(r'\d{4}-\d{2}-\d{2}', date_str):
-                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
                 return dt.replace(hour=23, minute=59, second=59, tzinfo=tz.utc)
             
-            # 2. Try "Apr 19" format (assume current year)
-            dt = datetime.strptime(f"{date_str}, 2026", "%b %d, %Y")
-            return dt.replace(hour=23, minute=59, second=59, tzinfo=tz.utc)
-        except Exception:
+            # 2. Try "Apr 19" or "May 6" or "May 06" format (assume current year)
+            for fmt in ["%b %d, %Y", "%b %d", "%B %d", "%d %b", "%d %B"]:
+                try:
+                    if '%Y' in fmt:
+                        dt = datetime.strptime(f"{date_str}, 2026", fmt)
+                    else:
+                        dt = datetime.strptime(f"{date_str}, 2026", fmt + ", %Y")
+                    return dt.replace(hour=23, minute=59, second=59, tzinfo=tz.utc)
+                except Exception:
+                    continue
+            
+            # 3. Fallback: try dateutil
             try:
-                # 3. Try "19 Apr" format
-                dt = datetime.strptime(f"{date_str}, 2026", "%d %b, %Y")
+                import dateutil.parser
+                dt = dateutil.parser.parse(date_str, default=datetime(2026, 1, 1))
                 return dt.replace(hour=23, minute=59, second=59, tzinfo=tz.utc)
             except Exception:
-                return None
+                pass
+                
+        except Exception:
+            pass
+        
+        # Last resort: assume today so the job isn't silently dropped
+        return datetime.now(tz=tz.utc)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -522,25 +546,52 @@ class MigrateMateScraper:
     Pages: /visa-sponsorship-jobs/h1b, /opt, /tn, etc.
     """
     CATEGORIES = [
+        # ── General visa pages (5 jobs each) ──
         ('h1b-jobs', 'H-1B'),
         ('opt-jobs', 'OPT/CPT'),
         ('tn-jobs', 'TN'),
         ('green-card-jobs', 'Green Card'),
+        ('entry-level-jobs', 'Entry Level'),
+        # ── Software Engineering ──
         ('h1b-jobs/software-engineer', 'Software Engineer'),
-        ('h1b-jobs/mechanical-engineer', 'Mechanical Engineer'),
-        ('h1b-jobs/product-manager', 'Product Manager'),
-        ('h1b-jobs/marketing-manager', 'Marketing Manager'),
-        ('h1b-jobs/civil-engineer', 'Civil Engineer'),
+        ('h1b-jobs/backend-developer', 'Backend Developer'),
+        ('h1b-jobs/frontend-developer', 'Frontend Developer'),
+        ('h1b-jobs/full-stack-developer', 'Full Stack Developer'),
+        ('h1b-jobs/java-developer', 'Java Developer'),
+        ('h1b-jobs/python-developer', 'Python Developer'),
+        ('h1b-jobs/mobile-developer', 'Mobile Developer'),
+        # ── Infrastructure & DevOps ──
+        ('h1b-jobs/devops-engineer', 'DevOps Engineer'),
+        ('h1b-jobs/cloud-engineer', 'Cloud Engineer'),
+        ('h1b-jobs/site-reliability-engineer', 'SRE'),
+        # ── Data & AI ──
         ('h1b-jobs/data-analyst', 'Data Analyst'),
+        ('h1b-jobs/data-engineer', 'Data Engineer'),
+        ('h1b-jobs/data-scientist', 'Data Scientist'),
+        ('h1b-jobs/machine-learning-engineer', 'ML Engineer'),
+        # ── Management & Business ──
+        ('h1b-jobs/product-manager', 'Product Manager'),
+        ('h1b-jobs/project-manager', 'Project Manager'),
         ('h1b-jobs/business-analyst', 'Business Analyst'),
         ('h1b-jobs/finance-analyst', 'Finance Analyst'),
+        # ── Design & QA ──
+        ('h1b-jobs/ux-designer', 'UX Designer'),
+        ('h1b-jobs/qa-engineer', 'QA Engineer'),
+        # ── Engineering ──
+        ('h1b-jobs/mechanical-engineer', 'Mechanical Engineer'),
+        ('h1b-jobs/civil-engineer', 'Civil Engineer'),
+        ('h1b-jobs/electrical-engineer', 'Electrical Engineer'),
+        # ── OPT specific tech ──
+        ('opt-jobs/software-engineer', 'OPT Software Engineer'),
+        ('opt-jobs/data-analyst', 'OPT Data Analyst'),
+        ('opt-jobs/data-engineer', 'OPT Data Engineer'),
     ]
 
     def fetch(self, query=None):
         all_jobs = []
-        # Increase to 3 categories per pass for better coverage
+        # Scrape ALL categories every pass for maximum coverage
         import random
-        selected_cats = random.sample(self.CATEGORIES, min(3, len(self.CATEGORIES)))
+        selected_cats = list(self.CATEGORIES)  # ALL 12 categories, not just 3
         
         # Select ONE persistent identity for this sync cycle
         ua = random.choice(USER_AGENTS)
@@ -586,27 +637,46 @@ class MigrateMateScraper:
 
     def _parse_html(self, html, visa_type, slug):
         """
-        Parse MigrateMate job listing HTML using JSON-LD (Schema.org) structured data.
-        This is 100% reliable even if the React-based SPA structure changes.
+        Parse MigrateMate job listing HTML.
+        Strategy:
+          1. Extract individual job page links from HTML job cards (most reliable)
+          2. Cross-reference JSON-LD ItemList for metadata (title, company, date, location)
+          3. These migratemate.co/job/... URLs redirect to direct ATS pages via LinkResolver
         """
         import json
         import hashlib
         jobs = []
         soup = BeautifulSoup(html, 'html.parser')
 
-        # Find the JSON-LD ItemList script
+        # ── Step 1: Extract individual job links from HTML card elements ──
+        # MigrateMate renders job cards as <a href="/job/company-slug/job-slug">
+        html_job_links = {}  # title_key -> migratemate_url
+        
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag.get('href', '')
+            # Match patterns: /job/..., /h1b-jobs/..., /opt-jobs/..., /jobs/...
+            if re.match(r'^/(?:job|h1b-jobs|opt-jobs|tn-jobs|green-card-jobs)/[^/]+/[^/]+', href):
+                full_url = f"https://migratemate.co{href}"
+                # Extract a title hint from the URL slug
+                parts = href.rstrip('/').split('/')
+                if len(parts) >= 3:
+                    slug_key = parts[-1].replace('-', ' ').lower()
+                    if full_url not in html_job_links.values():
+                        html_job_links[slug_key] = full_url
+
+        log.info(f"    🔗 MigrateMate HTML links found: {len(html_job_links)}")
+
+        # ── Step 2: Parse JSON-LD for metadata ──
         scripts = soup.find_all('script', type='application/ld+json')
         found_data = False
         
         for s in scripts:
             try:
-                # Use .text instead of .string to avoid None issues if there are comments inside script tag
                 script_content = s.text.strip()
                 if not script_content: continue
                 
                 data = json.loads(script_content)
                 
-                # MigrateMate stores jobs in an ItemList graph
                 if isinstance(data, dict) and data.get('@type') == 'ItemList':
                     elements = data.get('itemListElement', [])
                     for element in elements:
@@ -620,7 +690,6 @@ class MigrateMateScraper:
                             loc_info = item.get('jobLocation', {})
                             if isinstance(loc_info, list) and loc_info:
                                 loc_info = loc_info[0]
-                            
                             address = loc_info.get('address', {})
                             if isinstance(address, dict):
                                 city = address.get('addressLocality', '')
@@ -629,12 +698,26 @@ class MigrateMateScraper:
                             else:
                                 location = 'USA'
 
-                            # Apply URL fallback to the category page if missing
-                            apply_url = item.get('url', '')
+                            # ── URL Resolution Priority ──
+                            # 1. JSON-LD url field (usually empty on MigrateMate)
+                            apply_url = item.get('url', '').strip()
+                            
+                            # 2. Match via HTML job links using title slug
+                            if not apply_url or 'migratemate.co' in apply_url:
+                                title_slug = re.sub(r'[^a-z0-9\s]', '', title.lower())
+                                title_words = [w for w in title_slug.split() if len(w) > 2]
+                                for link_key, link_url in html_job_links.items():
+                                    # Match if most title words appear in the slug
+                                    matches = sum(1 for w in title_words if w in link_key)
+                                    if title_words and matches / len(title_words) >= 0.5:
+                                        apply_url = link_url
+                                        break
+                            
+                            # 3. Fallback: category page (will trigger DDG search in resolver)
                             if not apply_url:
                                 apply_url = f"https://migratemate.co/{slug}"
                             
-                            # Date Posted - CRITICAL for engine filtering
+                            # Date Posted
                             raw_date = item.get('datePosted')
                             posted_dt = self._parse_iso_date(raw_date)
                             

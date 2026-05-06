@@ -180,11 +180,19 @@ class ScraperEngine:
                     return False
                 self.jobright_stats['internships'] += 1
 
-        # 4. STRICT 24-Hour Date Filter (Requested: "Last 24 hours")
+        # 4. DATE FILTER — 24h for Simplify (exact timestamps), 48h for Jobright/MigrateMate
+        # Jobright & MigrateMate use date-only fields (no time), stored as 23:59:59 UTC.
+        # A "today" job can appear up to ~47h old by the time we check it.
         posted_date = raw.get('posted_date')
-        if not posted_date: 
-            log.info(f"  ❌ Missing date skip: {title}")
-            return False
+        if not posted_date:
+            # MigrateMate _parse_iso_date already falls back to now(), so this is rare
+            if 'MigrateMate' in source or 'Jobright' in source:
+                log.info(f"  ⚠️ Missing date — assuming today: {title}")
+                from datetime import datetime as _dt
+                posted_date = _dt.now(tz=tz.utc)
+            else:
+                log.info(f"  ❌ Missing date skip: {title}")
+                return False
         
         # Ensure it's aware
         if posted_date.tzinfo is None:
@@ -192,9 +200,15 @@ class ScraperEngine:
 
         time_since_posted = timezone.now() - posted_date
         
-        # Strictly 24 hours Hard Limit (Requested by User)
-        if time_since_posted.total_seconds() > 86400:
-            log.info(f"  ❌ Stale skip (>24h): {title}")
+        # Simplify uses exact unix timestamps — strict 24h
+        # Jobright/MigrateMate use date-only fields — allow 48h window
+        if 'Simplify' in source:
+            max_age_seconds = 86400  # 24 hours
+        else:
+            max_age_seconds = 172800  # 48 hours (covers date-only entries)
+        
+        if time_since_posted.total_seconds() > max_age_seconds:
+            log.info(f"  ❌ Stale skip (>{max_age_seconds//3600}h): {title}")
             return False
             
         # 5. Duplicate Check (field-based + hash for backward compatibility)

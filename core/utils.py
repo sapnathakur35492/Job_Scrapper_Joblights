@@ -254,10 +254,29 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
     Active verification: Send an HTTP GET to ensure the URL is alive (200 OK)
     and does not contain text indicating the job is expired/closed.
     Uses Django caching to avoid repeated hits and BeautifulSoup to avoid false positives.
+    
+    FAST PATH: Known ATS direct links (greenhouse, lever, workday, ashby) are trusted
+    without a live HTTP check — they are always valid job-specific pages.
     """
     from django.core.cache import cache
     import requests
     import urllib3
+    
+    # ── FAST PATH: Trusted direct ATS links — skip HTTP verification ──
+    # These are always specific job pages with stable URLs. No need to hit them.
+    trusted_ats = [
+        'boards.greenhouse.io', 'job-boards.greenhouse.io',
+        'jobs.lever.co', 'hire.lever.co',
+        'myworkdayjobs.com',
+        'jobs.ashbyhq.com',
+        'jobs.smartrecruiters.com',
+        'apply.workable.com',
+        'careers.icims.com',
+        'app.bamboohr.com',
+    ]
+    url_lower = url.lower()
+    if any(ats in url_lower for ats in trusted_ats):
+        return True  # Trusted ATS — no HTTP check needed
     from bs4 import BeautifulSoup
     import hashlib
     urllib3.disable_warnings()
@@ -277,8 +296,8 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
     }
     
     try:
-        # 2. Strict 4-second timeout to avoid hanging the scraper
-        resp = requests.get(url, headers=headers, timeout=4, allow_redirects=True, verify=False)
+        # 2. Strict 8-second timeout to avoid hanging the scraper
+        resp = requests.get(url, headers=headers, timeout=8, allow_redirects=True, verify=False)
         if resp.status_code != 200:
             cache.set(cache_key, False, 86400) # Cache failures for 24h
             return False
@@ -333,7 +352,7 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
             stale_days_match = re.search(r'posted\s+(\d+)\s+days?\s+ago', page_text)
             if stale_days_match:
                 days = int(stale_days_match.group(1))
-                if days > 1:
+                if days > 2:  # >2 days (was >1, too aggressive for jobs posted yesterday)
                     print(f"    [STALE ATS] Job posted {days} days ago. Rejecting.")
                     cache.set(cache_key, False, 86400)
                     return False
@@ -433,7 +452,7 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
                 score += 30 # Pass if not provided
 
             # FINAL THRESHOLD CHECK
-            if score < 70: # Back to 70, but we now have better soft-404 detection above
+            if score < 50:  # Reduced from 70 to 50 — less aggressive rejection
                 # Identity check failed
                 cache.set(cache_key, False, 86400)
                 return False
@@ -441,9 +460,10 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
         cache.set(cache_key, True, 86400)
         return True
     except Exception:
-        # Timeout or connection error -> assume dead/blocked
-        cache.set(cache_key, False, 86400)
-        return False
+        # Timeout or connection error — assume VALID (don't discard good jobs for network issues)
+        # Only hard failures (soft-404, expired text) should cause rejection above
+        cache.set(cache_key, True, 3600)  # Cache optimistically for 1h
+        return True
 
 def generate_job_hash(company, title, location, apply_url=''):
     """Generate dedup hash. Includes normalized apply URL for cross-source accuracy."""
