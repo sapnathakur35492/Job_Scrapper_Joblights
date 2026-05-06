@@ -46,6 +46,22 @@ scraper.headers.update({
     'DNT': '1',
 })
 
+def get_with_retry(session, url, attempts=3, delay_range=(0.6, 1.4), **kwargs):
+    """HTTP GET with retry and jittered delay."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = session.get(url, **kwargs)
+            if resp.status_code < 500:
+                return resp
+        except Exception as exc:
+            last_exc = exc
+        if attempt < attempts:
+            time.sleep(random.uniform(*delay_range))
+    if last_exc:
+        raise last_exc
+    return None
+
 
 # ═══════════════════════════════════════════════════════════
 #  LINK RESOLVER — Get Direct Company Links
@@ -134,7 +150,7 @@ class LinkResolver:
                                 from duckduckgo_search import DDGS
 
                             with DDGS() as ddgs:
-                                results = list(ddgs.text(search_query, max_results=8))
+                                results = list(ddgs.text(search_query))
                                 for res in results:
                                     res_url = res.get('href', '')
                                     if any(portal in res_url.lower() for portal in cls.COMMON_PORTALS):
@@ -147,7 +163,9 @@ class LinkResolver:
                         try:
                             import urllib.parse
                             yahoo_url = f"https://search.yahoo.com/search?p={urllib.parse.quote(search_query)}"
-                            resp = session.get(yahoo_url, timeout=12)
+                            resp = get_with_retry(session, yahoo_url, timeout=12, attempts=3)
+                            if not resp:
+                                continue
                             if resp.status_code == 200:
                                 soup = BeautifulSoup(resp.text, 'html.parser')
                                 for a in soup.find_all('a', href=True):
@@ -179,7 +197,9 @@ class LinkResolver:
                 'Referer': 'https://google.com/',
             }
             
-            resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+            resp = get_with_retry(session, url, headers=headers, timeout=15, allow_redirects=True, attempts=3)
+            if not resp:
+                return None
             
             # Anti-Bot 401/403 Handling
             if resp.status_code in [401, 403]:
@@ -187,7 +207,9 @@ class LinkResolver:
                 time.sleep(2)
                 headers['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
                 headers['Referer'] = 'https://linkedin.com/'
-                resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+                resp = get_with_retry(session, url, headers=headers, timeout=15, allow_redirects=True, attempts=3)
+                if not resp:
+                    return None
                 
                 if resp.status_code in [401, 403]:
                     log.warning(f"      ❌ Still blocked (401/403), safely skipping: {urlparse(url).netloc}")
@@ -244,14 +266,21 @@ class SimplifyScraper:
         ("SimplifyJobs", "New-Grad-Positions", "dev"),
     ]
 
-    def fetch(self, query=None):
+    def fetch(self, query=None, should_continue=None, resume_state=None, progress_callback=None):
         jobs = []
+        resume_state = resume_state or {}
+        done_repos = set(resume_state.get('done_repos', []))
         for org, repo, branch in self.REPOS:
+            if repo in done_repos:
+                continue
+            repo_jobs = []
             url = f"https://raw.githubusercontent.com/{org}/{repo}/refs/heads/{branch}/.github/scripts/listings.json"
             try:
                 log.info(f"    📥 Fetching Simplify: {org}/{repo}")
                 time.sleep(random.uniform(1.0, 2.0)) # Delay to prevent bot detection
-                resp = scraper.get(url, timeout=30)
+                resp = get_with_retry(scraper, url, timeout=30, attempts=3)
+                if not resp:
+                    continue
                 if resp.status_code != 200:
                     log.warning(f"    ⚠️ Simplify {repo} returned {resp.status_code}")
                     continue
@@ -298,7 +327,7 @@ class SimplifyScraper:
                     if any(d in apply_url_lower for d in ['simplify.jobs', 'github.com/SimplifyJobs']):
                         continue
 
-                    jobs.append({
+                    job_obj = {
                         'source': f'Simplify/{repo}',
                         'source_job_id': item.get('id', ''),
                         'title': title,
@@ -311,10 +340,19 @@ class SimplifyScraper:
                         'company_logo': '',
                         'posted_date': posted_date,
                         'visa_type': visa_type,
-                    })
+                    }
+                    jobs.append(job_obj)
+                    repo_jobs.append(job_obj)
 
             except Exception as e:
                 log.error(f"    ❌ Simplify {repo} error: {e}")
+            done_repos.add(repo)
+            if progress_callback:
+                progress_callback({'done_repos': sorted(done_repos)})
+            print(f"{repo} -> jobs: {len(repo_jobs)}")
+            print(f"{repo} -> pages fetched: 1")
+            if should_continue and not should_continue():
+                break
 
         log.info(f"    ✅ Simplify total active: {len(jobs)}")
         return jobs
@@ -374,9 +412,11 @@ class JobrightScraper:
         "2026-Others-Internship"
     ]
 
-    def fetch(self, query=None):
+    def fetch(self, query=None, should_continue=None, resume_state=None, progress_callback=None):
         jobs = []
         log.info(f"    🚀 Fetching Jobright repos in parallel...")
+        resume_state = resume_state or {}
+        done_repos = set(resume_state.get('done_repos', []))
         
         def fetch_repo(repo):
             # Use a fresh scraper per thread for maximum isolation
@@ -386,36 +426,65 @@ class JobrightScraper:
                 branch = 'master'
                 url = f"https://raw.githubusercontent.com/jobright-ai/{repo}/{branch}/README.md"
                 
-                resp = s.get(url, timeout=25)
+                resp = get_with_retry(s, url, timeout=25, attempts=3)
+                if not resp:
+                    print(f"{repo} -> jobs: 0")
+                    print(f"{repo} -> pages fetched: 0")
+                    return []
                 if resp.status_code == 200:
-                    return self._parse_markdown_table(resp.text, repo)
+                    repo_jobs = self._parse_markdown_table(resp.text, repo)
+                    print(f"{repo} -> jobs: {len(repo_jobs)}")
+                    print(f"{repo} -> pages fetched: 1")
+                    return repo_jobs
                 
                 # Fallback to 'main'
                 branch = 'main'
                 url = f"https://raw.githubusercontent.com/jobright-ai/{repo}/{branch}/README.md"
-                resp = s.get(url, timeout=25)
+                resp = get_with_retry(s, url, timeout=25, attempts=3)
+                if not resp:
+                    print(f"{repo} -> jobs: 0")
+                    print(f"{repo} -> pages fetched: 0")
+                    return []
                 if resp.status_code == 200:
-                    return self._parse_markdown_table(resp.text, repo)
+                    repo_jobs = self._parse_markdown_table(resp.text, repo)
+                    print(f"{repo} -> jobs: {len(repo_jobs)}")
+                    print(f"{repo} -> pages fetched: 1")
+                    return repo_jobs
                 
                 # Fallback to 'master' (Common in older Jobright repos)
                 branch = 'master'
                 url = f"https://raw.githubusercontent.com/jobright-ai/{repo}/{branch}/README.md"
-                resp = s.get(url, timeout=25)
+                resp = get_with_retry(s, url, timeout=25, attempts=3)
+                if not resp:
+                    print(f"{repo} -> jobs: 0")
+                    print(f"{repo} -> pages fetched: 0")
+                    return []
                 if resp.status_code == 200:
-                    return self._parse_markdown_table(resp.text, repo)
+                    repo_jobs = self._parse_markdown_table(resp.text, repo)
+                    print(f"{repo} -> jobs: {len(repo_jobs)}")
+                    print(f"{repo} -> pages fetched: 1")
+                    return repo_jobs
                 
+                print(f"{repo} -> jobs: 0")
+                print(f"{repo} -> pages fetched: 0")
                 return []
             except Exception as e:
-                log.debug(f"    ⚠️ Jobright {repo} skip: {e}")
+                log.error(f"    ⚠️ Jobright {repo} skip: {e}")
+                print(f"{repo} -> jobs: 0")
+                print(f"{repo} -> pages fetched: 0")
                 return []
 
-        # Concurrency for speed
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_repo = {executor.submit(fetch_repo, r): r for r in self.REPOS}
-            for future in as_completed(future_to_repo):
-                result = future.result()
-                if result:
-                    jobs.extend(result)
+        for repo in self.REPOS:
+            if should_continue and not should_continue():
+                break
+            if repo in done_repos:
+                continue
+            result = fetch_repo(repo)
+            if result:
+                jobs.extend(result)
+            done_repos.add(repo)
+            if progress_callback:
+                progress_callback({'done_repos': sorted(done_repos)})
         
         log.info(f"    ✅ Jobright total: {len(jobs)} jobs fetched from GitHub.")
         return jobs
@@ -498,13 +567,16 @@ class JobrightScraper:
                     'visa_type': '',
                     'company_logo': ''
                 })
-            except Exception: continue
+            except Exception as e:
+                log.debug(f"    ⚠️ Parse row skipped in {repo_name}: {e}")
+                continue
         return jobs
 
     def _parse_date(self, date_str):
         if not date_str:
             return None
         date_str = re.sub(r'[*\u2605]', '', date_str).strip()
+        current_year = datetime.now(tz=tz.utc).year
         try:
             # 1. Try "2026-04-25" or "2026-05-06" ISO format
             if re.match(r'\d{4}-\d{2}-\d{2}', date_str):
@@ -515,9 +587,9 @@ class JobrightScraper:
             for fmt in ["%b %d, %Y", "%b %d", "%B %d", "%d %b", "%d %B"]:
                 try:
                     if '%Y' in fmt:
-                        dt = datetime.strptime(f"{date_str}, 2026", fmt)
+                        dt = datetime.strptime(date_str, fmt)
                     else:
-                        dt = datetime.strptime(f"{date_str}, 2026", fmt + ", %Y")
+                        dt = datetime.strptime(f"{date_str}, {current_year}", fmt + ", %Y")
                     return dt.replace(hour=23, minute=59, second=59, tzinfo=tz.utc)
                 except Exception:
                     continue
@@ -525,7 +597,7 @@ class JobrightScraper:
             # 3. Fallback: try dateutil
             try:
                 import dateutil.parser
-                dt = dateutil.parser.parse(date_str, default=datetime(2026, 1, 1))
+                dt = dateutil.parser.parse(date_str, default=datetime(current_year, 1, 1))
                 return dt.replace(hour=23, minute=59, second=59, tzinfo=tz.utc)
             except Exception:
                 pass
@@ -587,7 +659,7 @@ class MigrateMateScraper:
         ('opt-jobs/data-engineer', 'OPT Data Engineer'),
     ]
 
-    def fetch(self, query=None):
+    def fetch(self, query=None, should_continue=None, resume_state=None, progress_callback=None):
         all_jobs = []
         # Scrape ALL categories every pass for maximum coverage
         import random
@@ -603,15 +675,22 @@ class MigrateMateScraper:
             # Step 1: Human-like landing
             establishment_scraper.get("https://migratemate.co/h1b-jobs", timeout=30)
             time.sleep(2) 
-        except:
-            pass
+        except Exception as e:
+            log.warning(f"    ⚠️ MigrateMate warmup failed: {e}")
 
-        for slug, cat_name in selected_cats:
+        resume_state = resume_state or {}
+        category_progress = resume_state.get('category_progress', {})
+        start_idx = int(resume_state.get('category_index', 0))
+
+        for idx, (slug, cat_name) in enumerate(selected_cats):
+            if idx < start_idx:
+                continue
+            if should_continue and not should_continue():
+                break
             try:
-                url = f"https://migratemate.co/{slug}"
+                base_url = f"https://migratemate.co/{slug}"
                 log.info(f"    📥 Single-Drip Fetch: {cat_name}")
-                
-                resp = establishment_scraper.get(url, timeout=30, headers={
+                headers = {
                     'Referer': 'https://migratemate.co/h1b-jobs',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.5',
@@ -619,21 +698,89 @@ class MigrateMateScraper:
                     'Sec-Fetch-Mode': 'navigate',
                     'Sec-Fetch-Site': 'same-origin',
                     'Upgrade-Insecure-Requests': '1',
-                })
-                
-                if resp.status_code != 200:
-                    log.warning(f"    ⚠️ MigrateMate {slug} block ({resp.status_code}).")
-                    continue
-
-                parsed = self._parse_html(resp.text, cat_name, slug)
-                all_jobs.extend(parsed)
-                
-                log.info(f"    ← Stealth success ({cat_name}): {len(parsed)} jobs")
+                }
+                cat_state = category_progress.get(slug, {})
+                page = int(cat_state.get('next_page', 1))
+                page_count = 0
+                cat_jobs = 0
+                seen_page_signatures = set()
+                while True:
+                    if should_continue and not should_continue():
+                        break
+                    url = base_url if page == 1 else f"{base_url}?page={page}"
+                    resp = get_with_retry(establishment_scraper, url, timeout=30, headers=headers, attempts=3)
+                    if not resp or resp.status_code != 200:
+                        if page == 1:
+                            log.warning(f"    ⚠️ MigrateMate {slug} block ({resp.status_code if resp else 'no-response'}).")
+                        break
+                    parsed = self._parse_html(resp.text, cat_name, slug)
+                    sig = '|'.join(sorted(j.get('source_job_id', '') for j in parsed if j.get('source_job_id')))
+                    if not parsed or sig in seen_page_signatures:
+                        break
+                    seen_page_signatures.add(sig)
+                    all_jobs.extend(parsed)
+                    cat_jobs += len(parsed)
+                    page_count += 1
+                    log.info(f"    ← Stealth success ({cat_name}) page {page}: {len(parsed)} jobs")
+                    page += 1
+                    category_progress[slug] = {'next_page': page}
+                    if progress_callback:
+                        progress_callback({'category_index': idx, 'category_progress': category_progress})
+                    time.sleep(random.uniform(0.8, 1.8))
+                if cat_jobs == 0:
+                    fallback_jobs, fallback_pages = self._fallback_category_fetch(
+                        establishment_scraper, slug, cat_name, headers
+                    )
+                    all_jobs.extend(fallback_jobs)
+                    cat_jobs += len(fallback_jobs)
+                    page_count += fallback_pages
+                print(f"{cat_name} -> jobs: {cat_jobs}")
+                print(f"{cat_name} -> pages fetched: {page_count}")
+                category_progress[slug] = {'next_page': 1}
+                if progress_callback:
+                    progress_callback({'category_index': idx + 1, 'category_progress': category_progress})
                 time.sleep(random.uniform(2, 5)) # Delay between categories
             except Exception as e:
                 log.error(f"    ❌ MigrateMate error in {cat_name}: {e}")
 
         return all_jobs
+
+    def _fallback_category_fetch(self, session, slug, cat_name, headers):
+        """Fallback fetch for blocked category pages via parent listing pages."""
+        parent_slug = slug.split('/')[0]
+        base_url = f"https://migratemate.co/{parent_slug}"
+        slug_tokens = [
+            t for t in slug.replace('/', '-').split('-')
+            if t and t not in {'jobs', 'h1b', 'opt', 'tn', 'green', 'card'}
+        ]
+        jobs = []
+        pages_fetched = 0
+        seen_page_signatures = set()
+
+        page = 1
+        while True:
+            url = base_url if page == 1 else f"{base_url}?page={page}"
+            resp = get_with_retry(session, url, timeout=30, headers=headers, attempts=3)
+            if not resp or resp.status_code != 200:
+                break
+            parsed = self._parse_html(resp.text, cat_name, slug)
+            if slug_tokens:
+                parsed = [
+                    j for j in parsed
+                    if any(tok in (j.get('title', '') + ' ' + j.get('description', '')).lower() for tok in slug_tokens)
+                ]
+            sig = '|'.join(sorted(j.get('source_job_id', '') for j in parsed if j.get('source_job_id')))
+            if not parsed or sig in seen_page_signatures:
+                break
+            seen_page_signatures.add(sig)
+            jobs.extend(parsed)
+            pages_fetched += 1
+            page += 1
+            time.sleep(random.uniform(0.6, 1.2))
+
+        if jobs:
+            log.info(f"    🔁 Fallback recovered {len(jobs)} jobs for {slug}")
+        return jobs, pages_fetched
 
     def _parse_html(self, html, visa_type, slug):
         """

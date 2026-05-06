@@ -650,7 +650,7 @@ class JobrightURLExtractor:
                 from duckduckgo_search import DDGS
 
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=5))
+                results = list(ddgs.text(query))
                 for res in results:
                     url = res.get('href')
                     if url and _is_valid_job_url(url) and _is_url_for_company(url, company):

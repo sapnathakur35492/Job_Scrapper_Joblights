@@ -54,11 +54,21 @@ JOB_CATEGORIES = {
     ]
 }
 
+TARGET_KEYWORD_COUNT = 98
+
 def get_all_titles():
-    """Returns a flat list of all relevant job titles for filtering."""
+    """Returns the exact configured keyword set (98 unique titles)."""
     titles = []
+    seen = set()
     for cat in JOB_CATEGORIES.values():
-        titles.extend(cat)
+        for title in cat:
+            normalized = title.strip().lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            titles.append(title.strip())
+            if len(titles) >= TARGET_KEYWORD_COUNT:
+                return titles
     return titles
 
 def matches_target_titles(title):

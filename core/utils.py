@@ -260,7 +260,6 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
     """
     from django.core.cache import cache
     import requests
-    import urllib3
     
     # ── FAST PATH: Trusted direct ATS links — skip HTTP verification ──
     # These are always specific job pages with stable URLs. No need to hit them.
@@ -279,7 +278,6 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
         return True  # Trusted ATS — no HTTP check needed
     from bs4 import BeautifulSoup
     import hashlib
-    urllib3.disable_warnings()
 
     # 1. Check cache first (24h TTL)
     # Include company and title in cache key so that generic redirects don't poison correct job checks
@@ -296,8 +294,8 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
     }
     
     try:
-        # 2. Strict 8-second timeout to avoid hanging the scraper
-        resp = requests.get(url, headers=headers, timeout=8, allow_redirects=True, verify=False)
+        # Keep timeout short to avoid stalling a full sync pass.
+        resp = requests.get(url, headers=headers, timeout=4, allow_redirects=True)
         if resp.status_code != 200:
             cache.set(cache_key, False, 86400) # Cache failures for 24h
             return False
@@ -311,13 +309,10 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
             "couldn't find that job", "link you followed is broken"
         ]
         
-        # Workday specific 404 detection (often returns 200 with specific clip-art or text)
-        is_workday = 'myworkdayjobs.com' in url
-        if is_workday:
-            if "looking for doesn't exist" in text or "search for jobs" in text and len(text) < 10000:
-                # Workday 404s are usually small pages with a search button
-                if not expected_title.lower() in text:
-                    return False
+        # Workday specific soft-404 detection
+        if 'myworkdayjobs.com' in url and "looking for doesn't exist" in text:
+            cache.set(cache_key, False, 86400)
+            return False
 
         if any(phrase in text for phrase in soft_404_phrases):
             # Potential soft-404. Let's do a false-positive check.
@@ -333,80 +328,10 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
                 cache.set(cache_key, False, 86400)
                 return False
                 
-        # ══════════════════════════════════════════════════
-        # 4. JOB IDENTITY VERIFICATION LAYER
-        # ══════════════════════════════════════════════════
+        # Optional lightweight identity check
         if expected_company or expected_title:
             soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Extract plain text
             page_text = soup.get_text(separator=' ', strip=True).lower()
-            
-            # ══════════════════════════════════════════════════
-            #  TRUE 24-HOUR ATS FRESHNESS CHECK
-            # ══════════════════════════════════════════════════
-            # Check for explicitly stale dates on the ATS itself
-            import re
-            
-            # Pattern 1: "Posted X Days Ago" where X > 1
-            stale_days_match = re.search(r'posted\s+(\d+)\s+days?\s+ago', page_text)
-            if stale_days_match:
-                days = int(stale_days_match.group(1))
-                if days > 2:  # >2 days (was >1, too aggressive for jobs posted yesterday)
-                    print(f"    [STALE ATS] Job posted {days} days ago. Rejecting.")
-                    cache.set(cache_key, False, 86400)
-                    return False
-            
-            # Pattern 2: "Posted 30+ Days Ago" or similar text forms
-            stale_phrases = [
-                r'30\+\s+days\s+ago',
-                r'posted\s+a\s+month\s+ago',
-                r'posted\s+over\s+a\s+month\s+ago',
-                r'posted\s+[2-9]\s+weeks\s+ago',
-                r'posted\s+\d{2,}\s+weeks\s+ago',
-                r'posted\s+\d+\s+months?\s+ago'
-            ]
-            for phrase in stale_phrases:
-                if re.search(phrase, page_text):
-                    print(f"    [STALE ATS] Job posted very long ago (matched {phrase}). Rejecting.")
-                    cache.set(cache_key, False, 86400)
-                    return False
-            
-            # Look for JSON-LD datePosted
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string:
-                    page_text += " " + script.string.lower()
-                    
-            # Extract Meta tags
-            metas = soup.find_all('meta')
-            for meta in metas:
-                if meta.get('content'):
-                    page_text += " " + meta.get('content').lower()
-
-            # Pattern 3: JSON-LD datePosted or meta date
-            # Since page_text is lowercase, check for "dateposted": "2024-..."
-            date_posted_match = re.search(r'"dateposted"\s*:\s*"([^"]+)"', page_text)
-            print("DATE POSTED MATCH:", date_posted_match)
-            if date_posted_match:
-                date_str = date_posted_match.group(1)
-                try:
-                    from datetime import datetime, timezone as tz
-                    from django.utils import timezone
-                    import dateutil.parser
-                    
-                    dt = dateutil.parser.parse(date_str)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=tz.utc)
-                    diff = (timezone.now() - dt).total_seconds()
-                    if diff > 172800: # 48 hours (Increased to 48h to be safe)
-                        print(f"    [STALE ATS] JSON-LD datePosted > 48h. Rejecting.")
-                        try:
-                            cache.set(cache_key, False, 86400)
-                        except Exception: pass
-                        return False
-                except Exception as e:
-                    print(f"ERROR: {e}")
 
             score = 0
             
@@ -452,7 +377,7 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
                 score += 30 # Pass if not provided
 
             # FINAL THRESHOLD CHECK
-            if score < 50:  # Reduced from 70 to 50 — less aggressive rejection
+            if score < 40:
                 # Identity check failed
                 cache.set(cache_key, False, 86400)
                 return False
