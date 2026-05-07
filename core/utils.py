@@ -238,6 +238,12 @@ def is_valid_apply_url(url):
     if any(gap in path.lower() for gap in generic_ats_pages):
         return False
 
+    # 6c. Block all intermediary portal domains.
+    # Jobs must resolve to ATS or company domains, not intermediary listings.
+    intermediary_domains = ['jobright.ai', 'migratemate.co', 'simplify.jobs']
+    if any(d in netloc for d in intermediary_domains):
+        return False
+
     # 7. STRICT ATS VALIDATION: Must have a job identifier OR be a known ATS
     # Known ATS domains that inherently represent jobs when not blocked above
     known_ats = [

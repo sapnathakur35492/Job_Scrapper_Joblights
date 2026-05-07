@@ -225,18 +225,14 @@ class ScraperEngine:
                 if direct_link:
                     raw['external_apply_link'] = direct_link
                 else:
-                    # Jobright links MUST resolve to a direct ATS/company page.
-                    # If resolution fails, drop the job entirely — never save a
-                    # jobright.ai intermediary URL that would open their internal listing.
-                    if 'jobright.ai' in url:
-                        log.info(f"      🚫 Jobright link unresolvable, dropping: {raw.get('company', '')[:20]}")
-                        return None
-                    log.info(f"      ⚠️ Unresolvable link, keeping source URL: {raw.get('company', '')[:20]}")
-            except Exception:
-                if 'jobright.ai' in url:
-                    log.info(f"      🚫 Jobright resolution error, dropping: {raw.get('company', '')[:20]}")
+                    # All intermediary links MUST resolve to a direct ATS/company page.
+                    # If resolution fails, drop the job entirely — never save an
+                    # intermediary URL (like migratemate.co/h1b-jobs/...) that would open a generic list.
+                    log.info(f"      🚫 Intermediary link unresolvable, dropping: {raw.get('company', '')[:20]}")
                     return None
-                log.info(f"      ⚠️ Resolution error, keeping source URL: {raw.get('company', '')[:20]}")
+            except Exception:
+                log.info(f"      🚫 Resolution error, dropping: {raw.get('company', '')[:20]}")
+                return None
         return raw
 
     def _resolve_and_save_job(self, raw):
