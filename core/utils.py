@@ -395,6 +395,8 @@ def extract_job_metadata(title, desc):
     if valid_years:
         min_yr = min(valid_years)
         max_yr = max(valid_years)
+        metadata['min_experience'] = min_yr
+        metadata['max_experience'] = max_yr
         if min_yr == max_yr:
             if min_yr == 0:
                 metadata['experience_years'] = 'Entry Level'
@@ -407,8 +409,12 @@ def extract_job_metadata(title, desc):
     else:
         if is_entry_level(title, desc):
             metadata['experience_years'] = 'Entry Level'
+            metadata['min_experience'] = 0
+            metadata['max_experience'] = 2
         else:
             metadata['experience_years'] = 'Not Specified'
+            metadata['min_experience'] = None
+            metadata['max_experience'] = None
 
     # 3. Salary Range
     salary_regexes = [
@@ -441,6 +447,28 @@ def extract_job_metadata(title, desc):
         metadata['salary_range'] = 'Not Specified'
 
     return metadata
+
+def is_experience_allowed(metadata, max_limit=5):
+    """
+    Checks if the job experience requirements are within the allowed limit.
+    Default limit is 5 years.
+    """
+    title = metadata.get('title', '').lower()
+    min_exp = metadata.get('min_experience')
+    
+    # 1. Title Keyword Check (Always do this)
+    senior_keywords = ['senior', 'lead', 'staff', 'principal', 'vp', 'director', 'manager', 'head of']
+    if any(kw in title for kw in senior_keywords):
+        # Special case: "Junior" in title overrides senior keywords
+        if 'junior' not in title:
+            return False
+            
+    # 2. Numeric Range Check
+    # If minimum experience is explicitly specified and greater than the limit
+    if min_exp is not None and min_exp > max_limit:
+        return False
+        
+    return True
 
 def fetch_full_description(url):
     """

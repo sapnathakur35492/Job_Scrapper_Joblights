@@ -14,7 +14,8 @@ from core.utils import (
     is_visa_sponsored,
     is_us_based, is_direct_link, generate_job_hash,
     clean_location, get_favicon_url, fetch_full_description,
-    extract_job_metadata, is_valid_apply_url, is_live_apply_url
+    extract_job_metadata, is_valid_apply_url, is_live_apply_url,
+    is_experience_allowed
 )
 from core.scrapers.sources import SimplifyScraper, JobrightScraper, MigrateMateScraper, LinkResolver
 from core.scrapers.categories import matches_target_titles, get_all_titles
@@ -282,6 +283,14 @@ class ScraperEngine:
 
         # Extract dynamic metadata
         meta = extract_job_metadata(title, desc)
+        
+        # ══════════════════════════════════════════════════
+        #  EXPERIENCE FILTER — 0-5 Years Only
+        # ══════════════════════════════════════════════════
+        if not is_experience_allowed(meta | {'title': title}):
+            log.info(f"    🚫 Experience limit exceeded: {meta.get('experience_years')} — {title[:30]}")
+            return False
+
         job_hash = generate_job_hash(company, title, location, url)
 
         # Attempt to fetch full description if current one is too short
