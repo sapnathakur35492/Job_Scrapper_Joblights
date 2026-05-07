@@ -175,6 +175,13 @@ def is_valid_apply_url(url):
     path = parsed.path.rstrip('/')
     netloc = parsed.netloc.lower()
 
+    # Allow known intermediary detail pages as fallback when they are job-specific.
+    if 'migratemate.co' in netloc and path and path != '/':
+        return True
+    # NOTE: jobright.ai URLs are NOT allowed here — they must be resolved to
+    # direct ATS/company pages by the extractor. Unresolved jobright.ai links
+    # will be correctly rejected by the blocked domains list below.
+
     # 1. Block aggregator/intermediary domains
     blocked = [
         'jobright.ai', 'simplify.jobs', 'migratemate.co', 'github.com',
@@ -224,6 +231,11 @@ def is_valid_apply_url(url):
     # 6. Block login and dashboard pages
     login_paths = ['/login', '/signin', '/auth', '/dashboard', '/user', '/account']
     if any(lp in path.lower() for lp in login_paths):
+        return False
+
+    # 6b. Block generic ATS portal/intro pages (career homepages, not specific job postings)
+    generic_ats_pages = ['/jobs/intro', '/jobs/search', '/jobs/home', '/search/results', '/careers/home']
+    if any(gap in path.lower() for gap in generic_ats_pages):
         return False
 
     # 7. STRICT ATS VALIDATION: Must have a job identifier OR be a known ATS
@@ -296,8 +308,8 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
     try:
         # Keep timeout short to avoid stalling a full sync pass.
         resp = requests.get(url, headers=headers, timeout=4, allow_redirects=True)
-        if resp.status_code != 200:
-            cache.set(cache_key, False, 86400) # Cache failures for 24h
+        if resp.status_code in (404, 410):
+            cache.set(cache_key, False, 86400)
             return False
             
         # 3. Check for soft 404s (expired job pages that return 200)
@@ -325,60 +337,6 @@ def is_live_apply_url(url, expected_company='', expected_title=''):
             
             if not forms and not apply_buttons:
                 # Confirmed soft-404
-                cache.set(cache_key, False, 86400)
-                return False
-                
-        # Optional lightweight identity check
-        if expected_company or expected_title:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            page_text = soup.get_text(separator=' ', strip=True).lower()
-
-            score = 0
-            
-            # Check ATS Domain (Known direct paths get base confidence)
-            known_ats = ['greenhouse.io', 'lever.co', 'workday.com', 'myworkdayjobs.com', 'ashbyhq.com']
-            if any(ats in url.lower() for ats in known_ats):
-                score += 20
-                
-            # Job ID presence in URL or text (Heuristic: usually numbers or UUID)
-            # If the URL contains numbers/sluggified paths
-            if re.search(r'/[0-9]{4,}|/[a-f0-9]{8,}', url.lower()):
-                score += 10
-                
-            # Company Fuzzy Match
-            if expected_company:
-                comp_norm = re.sub(r'[^a-z0-9]', '', expected_company.lower())
-                # also check first word (e.g. 'Google LLC' -> 'google')
-                comp_first = expected_company.lower().split()[0]
-                comp_first_norm = re.sub(r'[^a-z0-9]', '', comp_first)
-                
-                if (len(comp_norm) > 2 and comp_norm in page_text) or \
-                   (len(comp_first_norm) > 2 and comp_first_norm in page_text):
-                    score += 40
-            else:
-                score += 40 # Pass if not provided
-                
-            # Title Fuzzy Match
-            if expected_title:
-                # Remove punctuation and split into words
-                title_clean = re.sub(r'[^a-z0-9\s]', '', expected_title.lower())
-                title_words = [w for w in title_clean.split() if len(w) > 2]
-                
-                if title_words:
-                    # Check how many words match
-                    matched_words = sum(1 for w in title_words if w in page_text)
-                    match_ratio = matched_words / len(title_words)
-                    
-                    if match_ratio >= 0.5: # At least half the meaningful words present
-                        score += 30
-                    elif match_ratio > 0:
-                        score += 15
-            else:
-                score += 30 # Pass if not provided
-
-            # FINAL THRESHOLD CHECK
-            if score < 40:
-                # Identity check failed
                 cache.set(cache_key, False, 86400)
                 return False
                 

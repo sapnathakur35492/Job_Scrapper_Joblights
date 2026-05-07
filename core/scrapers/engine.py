@@ -199,14 +199,14 @@ class ScraperEngine:
 
         # 4. Duplicate check by stable unique identifier (apply URL / source_job_id)
         source_job_id = str(raw.get('source_job_id', '')).strip().lower()
-        unique_key = (url.lower() or source_job_id)
+        unique_key = (source_job_id or url.lower())
         if not unique_key:
             return False
         if unique_key in self._seen_run_keys:
             return False
-        if Job.objects.filter(external_apply_link__iexact=url).exists():
-            return False
         if source_job_id and Job.objects.filter(source_job_id=source_job_id).exists():
+            return False
+        if not source_job_id and Job.objects.filter(external_apply_link__iexact=url).exists():
             return False
         self._seen_run_keys.add(unique_key)
             
@@ -225,12 +225,18 @@ class ScraperEngine:
                 if direct_link:
                     raw['external_apply_link'] = direct_link
                 else:
-                    # Resolution failed — discard this job entirely
-                    log.info(f"      ❌ Unresolvable link, discarding: {raw.get('company', '')[:20]}")
-                    return None
+                    # Jobright links MUST resolve to a direct ATS/company page.
+                    # If resolution fails, drop the job entirely — never save a
+                    # jobright.ai intermediary URL that would open their internal listing.
+                    if 'jobright.ai' in url:
+                        log.info(f"      🚫 Jobright link unresolvable, dropping: {raw.get('company', '')[:20]}")
+                        return None
+                    log.info(f"      ⚠️ Unresolvable link, keeping source URL: {raw.get('company', '')[:20]}")
             except Exception:
-                log.info(f"      ❌ Resolution error, discarding: {raw.get('company', '')[:20]}")
-                return None
+                if 'jobright.ai' in url:
+                    log.info(f"      🚫 Jobright resolution error, dropping: {raw.get('company', '')[:20]}")
+                    return None
+                log.info(f"      ⚠️ Resolution error, keeping source URL: {raw.get('company', '')[:20]}")
         return raw
 
     def _resolve_and_save_job(self, raw):
@@ -266,10 +272,6 @@ class ScraperEngine:
             self._live_url_cache[cache_key] = cached_live
         if not cached_live:
             log.warning(f"    💀 [IDENTITY/DEAD LINK] Rejected: {url[:60]} — {title[:30]} @ {company}")
-            return False
-        
-        # URL-based dedup (same URL from different title/source variations)
-        if Job.objects.filter(external_apply_link=url).exists():
             return False
         
         # Detect visa sponsorship 
